@@ -239,12 +239,13 @@ def _cache_path(cache_dir, key):
     return os.path.join(cache_dir, hashlib.sha256(key.encode("utf-8")).hexdigest()[:32] + ".json")
 
 
-def make(url, model="", key=None, cache_dir=None, timeout=20.0, rules=True):
+def make(url, model="", key=None, cache_dir=None, timeout=20.0, rules=True, pronounce=None):
     """Build the `normalize(piece_words) -> list[str]` function described in the docstring."""
     endpoint = url.rstrip("/") + "/chat/completions" if url else None
     headers = {"Content-Type": "application/json"}
     if key:
         headers["Authorization"] = "Bearer " + key
+    table = spoken_rules.load_table(pronounce) if rules else {}  # the user's own pronunciations
     level = [0]     # remembered request decoration: json_schema > json_object > plain
     failed = [0]    # consecutive failed requests; three open the breaker below
     broken = [False]
@@ -299,7 +300,7 @@ def make(url, model="", key=None, cache_dir=None, timeout=20.0, rules=True):
         out = list(words)
         kinds = [(spoken_rules.KEEP, None)] * len(words)
         if rules:
-            kinds = spoken_rules.apply(words)
+            kinds = spoken_rules.apply(words, table)
             for i, (kind, say) in enumerate(kinds):
                 if kind in (spoken_rules.SETTLED, spoken_rules.DEFAULT) and say:
                     nxt = words[i + 1] if i + 1 < len(words) else ""
@@ -315,7 +316,7 @@ def make(url, model="", key=None, cache_dir=None, timeout=20.0, rules=True):
             return out  # the rules settled everything; the endpoint is not needed
         stats["residue"] += 1
         ckey = f"{PROMPT_VERSION if rules else _LEGACY_VERSION}\n" \
-               + (f"{spoken_rules.RULES_VERSION}\n" if rules else "") \
+               + (f"{spoken_rules.RULES_VERSION}\n{sorted(table.items())}\n" if rules else "") \
                + f"{model}\n{' '.join(words)}"
         if cache_dir is not None:
             try:

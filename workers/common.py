@@ -305,7 +305,8 @@ def serve(args, load):
         from normalizer import make
         normalize_fn = make(args.normalize_url, args.normalize_model,
                             key=os.environ.get("INKVOICE_NORMALIZE_KEY") if args.normalize_url else None,
-                            cache_dir=os.path.join(data_dir(), "normalize-cache") if args.normalize_url else None)
+                            cache_dir=os.path.join(data_dir(), "normalize-cache") if args.normalize_url else None,
+                            pronounce=os.path.join(data_dir(), "pronunciations.txt"))
     align_fn = None
     try:
         loaded = load()

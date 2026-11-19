@@ -33,8 +33,10 @@ title/rank names from abogen's MIT abogen/kokoro_text_normalization.py
 (https://github.com/denizsafak/abogen). Both were rewritten to decide one original
 token at a time; see THIRD_PARTY_NOTICES.md.
 """
+import os
 import re
 import sys
+import unicodedata
 
 RULES_VERSION = 3  # part of the normalizer cache key; bump whenever an outcome changes
 
@@ -88,6 +90,7 @@ _MONEY = re.compile(r"^([$£€])([\d,]*)(?:\.(\d+))?$")
 _PERCENT = re.compile(r"^(\d{1,3}(?:,\d{3})+|\d+)(?:\.(\d+))?$")   # used behind a % sign
 _CLOCK = re.compile(r"^(\d{1,2}):(\d{2})$")
 _INT = re.compile(r"^\d+$")
+_SAY_OK = re.compile(r"^[A-Za-z]+(?:[A-Za-z' -]*[A-Za-z])?$")     # a pronunciation table entry
 _GROUPED = re.compile(r"^\d{1,3}(?:,\d{3})+$")
 _DECIMAL = re.compile(r"^(\d+)\.(\d+)$")
 _CALIBER = re.compile(r"^\.(\d{1,3})(?:-(\d{1,2}))?(s)?$")
@@ -168,11 +171,50 @@ def _core(word):
     return word[i:j]
 
 
-def apply(words):
-    """One (kind, say) per word; say is None unless the kind is settled or default."""
+def load_table(path):
+    """User pronunciations from `path`: one `word = spoken form` per line, # starts a comment.
+    -> {casefolded word: spoken form}. A missing file is an empty table; bad lines are skipped."""
+    table = {}
+    if not path or not os.path.isfile(path):
+        return table
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            for n, line in enumerate(f, 1):
+                line = line.split("#", 1)[0].strip()
+                if not line:
+                    continue
+                word, sep, say = (s.strip() for s in line.partition("="))
+                if not sep or not word or " " in word or not _SAY_OK.match(say):
+                    print(f"spoken_rules: pronunciations line {n} skipped (want: word = letters only)", file=sys.stderr)
+                    continue
+                table[_fold(word)] = say
+    except OSError as e:
+        print(f"spoken_rules: pronunciations not read: {e}", file=sys.stderr)
+    return table
+
+
+def _fold(word):
+    return unicodedata.normalize("NFC", word).casefold().replace("’", "'")
+
+
+def _listed(c, table):
+    """Spoken form of a listed word, also for its plural and possessive."""
+    low = _fold(c)
+    if low in table:
+        return table[low]
+    for suffix in ("'s", "s"):
+        if low.endswith(suffix) and low[:-len(suffix)] in table:
+            return table[low[:-len(suffix)]] + suffix
+    return None
+
+
+def apply(words, table=None):
+    """One (kind, say) per word; say is None unless the kind is settled or default. Words in the
+    user's pronunciation table are settled first, whatever the rules would have said."""
+    listed = [_listed(_core(w), table) if table else None for w in words]
     if _ENG is None:
-        return [(KEEP, None)] * len(words)
-    return [_one(i, w, words) for i, w in enumerate(words)]
+        return [(SETTLED, s) if s else (KEEP, None) for s in listed]
+    return [(SETTLED, s) if s else _one(i, w, words) for i, (w, s) in enumerate(zip(words, listed))]
 
 
 def is_abbrev(word, nxt=""):

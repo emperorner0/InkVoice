@@ -46,6 +46,25 @@ their rule form and flagged words are spoken as written. When `inflect` cannot b
 the rule layer turns itself off with one line on the worker's stderr and the model, if one
 is configured, is asked about every word as before the rule layer existed. Nothing raises.
 
+## Your own pronunciations
+
+Some words are read differently from one occurrence to the next, typically names and loanwords
+with accented letters. To pin one down, create `<InkVoice data>/pronunciations.txt` with one
+`word = spoken form` entry per line:
+
+```
+# lines starting with # are comments
+doppelgänger = doppelganger
+Nguyen = nwin
+```
+
+A listed word is always spoken in the given form, before any other rule and without asking the
+model. Matching ignores case and also covers the plural and the possessive of the word. The
+spoken form may contain only letters, spaces, hyphens and apostrophes; other lines are skipped
+with a note on the worker's stderr. The file is read when the voice engine starts, so change a
+voice setting or restart the app after editing it, and regenerate the chapters that should
+pick it up.
+
 ## Turning it on
 
 In Settings, open "Pronunciation helper (experimental)" below the voice settings and tick
