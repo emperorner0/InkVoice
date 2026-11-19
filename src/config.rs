@@ -88,12 +88,6 @@ pub const KOKORO_PARAMS: &[Param] = &[PIECE];
 pub const QWEN3_VOICES: &[&str] = &["narrator"];
 pub const QWEN3_PARAMS: &[Param] = &[
     Param {
-        flag: "model",
-        label: "Model size",
-        help: "0.6B is faster and uses about 3 GB of GPU memory. 1.7B follows the voice sample more closely and uses about 5 GB.",
-        kind: Kind::Choice { options: &[("0.6B", "0.6B (faster)"), ("1.7B", "1.7B (closer to the sample)")], default: 0 },
-    },
-    Param {
         flag: "temperature",
         label: "Temperature",
         help: "Randomness of the delivery. Lower = steadier, higher = livelier but more mistakes. Qwen3 default 0.9.",

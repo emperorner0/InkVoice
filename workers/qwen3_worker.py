@@ -5,7 +5,6 @@ A voice is a folder in <InkVoice data>/voices/<name>/ holding
   ref.txt  the exact words spoken in ref.wav
 Every piece is cloned from that sample, so the reader stays the same for the whole book.
 
-  --model        0.6B (faster, ~3 GB of GPU memory) or 1.7B (closer to the sample, ~5 GB)
   --temperature  sampling temperature (default 0.9; lower = steadier, higher = livelier)
 
 Word timings are measured by forced alignment (aligner.py), so the highlight follows the voice.
@@ -15,7 +14,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import common
 
 ap = common.base_args("narrator")
-ap.add_argument("--model", choices=["0.6B", "1.7B"], default="0.6B")
 ap.add_argument("--temperature", type=float, default=0.9)
 # shorter pieces than the small engines: long clones drift, and each piece must fit the model's window
 ap.set_defaults(max_chars=400)
@@ -35,7 +33,7 @@ def load():
         ref_text = f.read().strip()
 
     from faster_qwen3_tts import FasterQwen3TTS
-    tts = FasterQwen3TTS.from_pretrained(f"Qwen/Qwen3-TTS-12Hz-{args.model}-Base")
+    tts = FasterQwen3TTS.from_pretrained("Qwen/Qwen3-TTS-12Hz-0.6B-Base")
 
     def synth(text):
         wavs, _sr = tts.generate_voice_clone(
