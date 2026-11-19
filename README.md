@@ -35,6 +35,22 @@ text-to-speech models running entirely on your own machine. No cloud, no Electro
 |---|---|
 | ![Library](docs/screenshots/1_library.png) | ![Settings](docs/screenshots/4_settings.png) |
 
+## What this fork adds
+
+This repository is a fork of [sabeel111/InkVoice](https://github.com/sabeel111/InkVoice); the changes below sit on top of it.
+
+- Qwen3 cloned-voice engine: a fourth engine that clones the voice in a reference sample. It needs an NVIDIA
+  GPU with about 3 GB of free GPU memory. It installs from the app's voice-engine settings like the other
+  engines, into its own Python environment (about 7 GB with PyTorch and the model); that in-app install has
+  not been tested yet. A voice is a folder `<InkVoice data>/voices/<name>/` holding `ref.wav`, a clean 10 to
+  25 s sample of the voice, and `ref.txt`, the exact words spoken in that sample. The app currently lists one
+  voice, `narrator`.
+- Measured word timings for that engine: a small wav2vec2 model force-aligns the generated audio to the text,
+  so the highlighted word follows the voice. If alignment fails, the app falls back to the estimated timings
+  from punctuation and pauses.
+- Exact resume: the app remembers the word last heard for each book, and Play continues from that word after a
+  pause or an app restart.
+
 ## Install
 
 ### Linux (x86_64)
