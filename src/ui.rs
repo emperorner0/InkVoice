@@ -127,7 +127,7 @@ impl App {
             Some(Act::Open(id)) => self.open_reader(&id),
             Some(Act::Select(id)) => self.sel = Some(id),
             Some(Act::PlayPath(p, u)) => self.play_path(&p, u, None),
-            Some(Act::PlayUnit(u)) => self.play_unit(u, None),
+            Some(Act::PlayUnit(u)) => self.play_unit_resuming(u),
             Some(Act::Toggle) => self.toggle_play(),
             Some(Act::Enqueue(u)) => {
                 if self.engine_ready() {

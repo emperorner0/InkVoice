@@ -27,6 +27,19 @@ pub struct Book {
     /// unix seconds the book was last opened (progress.json)
     #[serde(skip, default)]
     pub opened: u64,
+    /// the word last heard, so listening resumes exactly there (progress.json)
+    #[serde(skip, default)]
+    pub listen: Option<Listen>,
+}
+
+/// Where listening stopped: the audio unit (chapter, or chapter + page in page mode) and the
+/// char offset of the spoken word inside that unit's text. Text offsets (not seconds) stay valid
+/// when the audio is regenerated or the voice changes.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct Listen {
+    pub ch: usize,
+    pub pg: Option<usize>,
+    pub chr: usize,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -34,6 +47,8 @@ struct Progress {
     ch: usize,
     pg: usize,
     opened: u64,
+    #[serde(default)]
+    listen: Option<Listen>,
 }
 
 pub fn now_secs() -> u64 {
@@ -84,14 +99,15 @@ impl Book {
     fn load_progress(&mut self) {
         let bytes = std::fs::read(self.dir().join("progress.json")).unwrap_or_default();
         let p = serde_json::from_slice::<Progress>(&bytes)
-            .or_else(|_| serde_json::from_slice::<(usize, usize)>(&bytes).map(|(ch, pg)| Progress { ch, pg, opened: 0 }))
+            .or_else(|_| serde_json::from_slice::<(usize, usize)>(&bytes).map(|(ch, pg)| Progress { ch, pg, opened: 0, listen: None }))
             .unwrap_or_default();
         let valid = p.ch < self.chapters.len() && p.pg < self.chapters[p.ch].pages.len();
         self.pos = if valid { (p.ch, p.pg) } else { (0, 0) };
         self.opened = p.opened;
+        self.listen = p.listen.filter(|l| l.ch < self.chapters.len() && l.pg.map_or(true, |pg| pg < self.chapters[l.ch].pages.len()));
     }
     pub fn save_progress(&self) {
-        let p = Progress { ch: self.pos.0, pg: self.pos.1, opened: self.opened };
+        let p = Progress { ch: self.pos.0, pg: self.pos.1, opened: self.opened, listen: self.listen.clone() };
         let _ = std::fs::write(self.dir().join("progress.json"), serde_json::to_vec(&p).unwrap());
     }
     /// Fraction of pages before the current position.
@@ -177,7 +193,7 @@ fn import_epub(path: &Path, stem: &str) -> Result<(Book, Option<Vec<u8>>)> {
     if chapters.len() < 2 {
         chapters = chapters_from_spine(&mut doc);
     }
-    Ok((Book { id: String::new(), title, author, source: String::new(), chapters, pos: (0, 0), opened: 0 }, cover))
+    Ok((Book { id: String::new(), title, author, source: String::new(), chapters, pos: (0, 0), opened: 0, listen: None }, cover))
 }
 
 /// One chapter per spine file, titled from its first line.
@@ -323,7 +339,7 @@ fn import_pdf(path: &Path, stem: &str) -> Result<Book> {
             }
         })
         .collect();
-    Ok(Book { id: String::new(), title: stem.to_string(), author: String::new(), source: String::new(), chapters, pos: (0, 0), opened: 0 })
+    Ok(Book { id: String::new(), title: stem.to_string(), author: String::new(), source: String::new(), chapters, pos: (0, 0), opened: 0, listen: None })
 }
 
 /// Split text into ~PAGE_CHARS pages on paragraph (then sentence/word) boundaries.
@@ -370,6 +386,18 @@ fn split_long(p: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    /// progress.json written by older versions (no listening position) still loads, and the
+    /// listening position round-trips.
+    #[test]
+    fn progress_keeps_listening_position() {
+        use super::{Listen, Progress};
+        let old: Progress = serde_json::from_str(r#"{"ch":3,"pg":1,"opened":7}"#).unwrap();
+        assert!(old.listen.is_none() && old.ch == 3 && old.pg == 1);
+        let p = Progress { ch: 2, pg: 0, opened: 1, listen: Some(Listen { ch: 2, pg: None, chr: 1234 }) };
+        let back: Progress = serde_json::from_slice(&serde_json::to_vec(&p).unwrap()).unwrap();
+        assert_eq!(back.listen, Some(Listen { ch: 2, pg: None, chr: 1234 }));
+    }
+
     #[test]
     fn imports_epub() {
         let Ok(p) = std::env::var("TEST_EPUB") else { return };

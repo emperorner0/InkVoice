@@ -124,6 +124,8 @@ pub struct App {
     inst: InstallUi,
     installed: HashSet<String>,
     confirm_uninstall: Option<String>,
+    /// when the listening position was last written to progress.json
+    listen_saved: Instant,
 }
 
 impl App {
@@ -180,6 +182,7 @@ impl App {
             },
             installed: installer::SPECS.iter().filter(|s| installer::is_installed(s.name)).map(|s| s.name.to_string()).collect(),
             confirm_uninstall: None,
+            listen_saved: Instant::now(),
             cfg,
         };
         app.sel = app.lib.first().map(|b| b.id.clone());
@@ -714,13 +717,80 @@ impl App {
         if let Some(p) = &mut self.player {
             if p.now.is_some() {
                 p.toggle();
+                self.track_listen(true);
                 return;
             }
         }
         if let Some(u) = self.reader_unit() {
             let page = self.pg;
-            self.play_unit(u, Some(page));
+            match self.resume_char(&u, Some(page)) {
+                Some(c) => {
+                    self.notify("Resuming where you stopped listening");
+                    self.play_from_char(u, Some(c));
+                }
+                None => self.play_unit(u, Some(page)),
+            }
         }
+    }
+
+    /// Play a chapter/page from its list button: from the word last heard if listening stopped
+    /// inside it, otherwise from its start.
+    fn play_unit_resuming(&mut self, u: Unit) {
+        match self.resume_char(&u, None) {
+            Some(c) => {
+                self.notify("Resuming where you stopped listening");
+                self.play_from_char(u, Some(c));
+            }
+            None => self.play_unit(u, None),
+        }
+    }
+
+    /// Char offset to resume `u` at, if listening last stopped inside it. With `page`, the stop
+    /// must also lie on that page of the chapter (so turning to another page plays that page).
+    fn resume_char(&self, u: &Unit, page: Option<usize>) -> Option<usize> {
+        let b = self.book(&u.book)?;
+        let l = b.listen.as_ref()?;
+        if l.ch != u.ch || l.pg != u.pg || l.chr == 0 {
+            return None;
+        }
+        if let (None, Some(pg)) = (u.pg, page) {
+            let starts = b.page_char_starts(u.ch);
+            let lo = *starts.get(pg)?;
+            let hi = starts.get(pg + 1).copied().unwrap_or(usize::MAX);
+            if l.chr < lo || l.chr >= hi {
+                return None;
+            }
+        }
+        Some(l.chr)
+    }
+
+    /// Remember the word being spoken (per book, in progress.json) so listening can resume
+    /// exactly there after a pause, a restart or a crash. Written at most every 2 s.
+    fn track_listen(&mut self, force: bool) {
+        if !force && self.listen_saved.elapsed().as_secs_f32() < 2.0 {
+            return;
+        }
+        let Some(p) = self.player.as_ref() else { return };
+        let Some(now) = p.now.as_ref() else { return };
+        if now.unit.book.is_empty() {
+            return; // voice preview
+        }
+        let Some(w) = p.current_word().and_then(|i| now.words.get(i)) else { return };
+        let l = book::Listen { ch: now.unit.ch, pg: now.unit.pg, chr: w.0 };
+        let id = now.unit.book.clone();
+        // listening without the reader showing this book: move the reading position along too
+        let in_reader = self.view == View::Reader && self.open.as_deref() == Some(id.as_str());
+        self.listen_saved = Instant::now();
+        let Some(b) = self.lib.iter_mut().find(|b| b.id == id) else { return };
+        if b.listen.as_ref() == Some(&l) {
+            return;
+        }
+        if !in_reader {
+            let pg = l.pg.unwrap_or_else(|| b.page_char_starts(l.ch).partition_point(|&s| s <= l.chr).saturating_sub(1));
+            b.pos = (l.ch, pg);
+        }
+        b.listen = Some(l);
+        b.save_progress();
     }
 
     fn skip_unit(&mut self, forward: bool) {
@@ -892,12 +962,22 @@ impl App {
         if self.player.as_ref().is_some_and(|p| p.finished()) {
             let u = self.player.as_ref().unwrap().now.as_ref().unwrap().unit.clone();
             self.player.as_mut().unwrap().stop();
+            if let Some(b) = self.lib.iter_mut().find(|b| b.id == u.book) {
+                if b.listen.as_ref().is_some_and(|l| l.ch == u.ch && l.pg == u.pg) {
+                    b.listen = None;
+                    b.save_progress();
+                }
+            }
             if self.cfg.continuous {
                 if let Some(n) = self.next_unit(&u) {
                     self.show_unit(&n);
                     self.play_unit(n, None);
                 }
             }
+        }
+
+        if self.player.as_ref().is_some_and(|p| p.is_playing()) {
+            self.track_listen(false);
         }
 
         // follow along: turn the page when the spoken word moves onto another page
