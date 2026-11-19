@@ -1152,6 +1152,44 @@ impl App {
                         );
                     });
 
+                ui.add_space(8.0);
+                egui::CollapsingHeader::new(RichText::new("PRONUNCIATION HELPER  ·  EXPERIMENTAL").small().strong().color(DIM))
+                    .id_salt("normalize")
+                    .default_open(std::env::var_os("SHOTS").is_some()) // screenshots only
+                    .show(ui, |ui| {
+                        dirty |= ui.checkbox(&mut cfg.normalize.enabled, "Enabled").changed();
+                        egui::Grid::new("normalize").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
+                            for (label, value, hint, secret) in [
+                                ("Server", &mut cfg.normalize.url, "http://127.0.0.1:8091/v1", false),
+                                ("Model", &mut cfg.normalize.model, "model name", false),
+                                ("Key", &mut cfg.normalize.key, "optional", true),
+                            ] {
+                                ui.label(label);
+                                let id = ui.id().with(("normalize", label));
+                                let mut s = ui.data_mut(|d| d.get_temp::<String>(id)).unwrap_or_else(|| value.clone());
+                                let r = ui.add(egui::TextEdit::singleline(&mut s).password(secret).hint_text(hint).desired_width(220.0));
+                                // keep the in-progress text across frames; commit on focus loss (Enter included), not
+                                // per keystroke, because applying restarts the voice engine
+                                if r.lost_focus() {
+                                    if s != *value {
+                                        *value = s;
+                                        dirty = true;
+                                    }
+                                    ui.data_mut(|d| d.remove_temp::<String>(id));
+                                } else if r.changed() {
+                                    ui.data_mut(|d| d.insert_temp(id, s.clone()));
+                                }
+                                ui.end_row();
+                            }
+                        });
+                        ui.label(
+                            RichText::new("A language model rewrites numbers, abbreviations and words like \"read\" into their spoken form before the voice reads them. It needs an OpenAI-compatible server, local or hosted.")
+                                .small()
+                                .color(DIM),
+                        );
+                        ui.label(RichText::new("Already generated chapters keep their audio until they are regenerated. The key is only needed for hosted servers.").small().color(DIM));
+                    });
+
                 section(ui, "READING");
                 egui::Grid::new("reading").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
                     ui.label("Font");

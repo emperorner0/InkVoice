@@ -46,7 +46,7 @@ pub struct Tts {
 }
 
 impl Tts {
-    pub fn start(cmd: Vec<String>, ctx: eframe::egui::Context) -> Self {
+    pub fn start(cmd: Vec<String>, key: Option<String>, ctx: eframe::egui::Context) -> Self {
         let queue: Arc<(Mutex<Queue>, Condvar)> = Arc::default();
         let (ev_tx, rx) = std::sync::mpsc::channel::<Event>();
         let child: Arc<Mutex<Option<Child>>> = Arc::default();
@@ -76,7 +76,7 @@ impl Tts {
                 };
                 let Some(job) = job else { break };
                 send(Event::Started(job.out.clone()));
-                let result = run_job(&cmd, &child_t, &mut io, &mut id, &job, &send);
+                let result = run_job(&cmd, &key, &child_t, &mut io, &mut id, &job, &send);
                 let preempted = {
                     let mut q = queue_t.0.lock().unwrap();
                     q.running = None;
@@ -151,6 +151,7 @@ impl Drop for Tts {
 
 fn run_job(
     cmd: &[String],
+    key: &Option<String>,
     child: &Mutex<Option<Child>>,
     io: &mut Option<(ChildStdin, BufReader<ChildStdout>)>,
     id: &mut u64,
@@ -166,6 +167,9 @@ fn run_job(
             .env("INKVOICE_DATA", &data)
             .env("HF_HOME", data.join("hf"))
             .env("PYTHONIOENCODING", "utf-8");
+        if let Some(k) = key {
+            command.env("INKVOICE_NORMALIZE_KEY", k);
+        }
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -242,7 +246,7 @@ for line in sys.stdin:
 
     #[test]
     fn play_now_interrupts_background_work_and_resumes_it() {
-        let tts = Tts::start(vec!["python3".into(), "-c".into(), FAKE.into()], eframe::egui::Context::default());
+        let tts = Tts::start(vec!["python3".into(), "-c".into(), FAKE.into()], None, eframe::egui::Context::default());
         let next = |timeout: f32| tts.rx.recv_timeout(Duration::from_secs_f32(timeout)).ok();
 
         tts.submit(job("background", None), false);

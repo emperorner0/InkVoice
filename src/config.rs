@@ -101,6 +101,22 @@ pub const QWEN3_PARAMS: &[Param] = &[
     },
 ];
 
+/// Optional LLM pass: rewrites words a voice misreads into their spoken form (workers/normalizer.py).
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(default)]
+pub struct Normalize {
+    pub enabled: bool,
+    pub url: String,
+    pub model: String,
+    pub key: String,
+}
+
+impl Default for Normalize {
+    fn default() -> Self {
+        Normalize { enabled: false, url: "http://127.0.0.1:8091/v1".into(), model: String::new(), key: String::new() }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(default)]
 pub struct Config {
@@ -128,6 +144,7 @@ pub struct Config {
     pub stream_buffer: f32,
     /// engine -> flag -> value: advanced generation settings changed from their defaults
     pub advanced: BTreeMap<String, BTreeMap<String, String>>,
+    pub normalize: Normalize,
 }
 
 impl Default for Config {
@@ -169,6 +186,7 @@ impl Default for Config {
             speed: 1.0,
             stream_buffer: 4.0,
             advanced: BTreeMap::new(),
+            normalize: Normalize::default(),
         }
     }
 }
@@ -269,7 +287,18 @@ impl Config {
                 }
             }
         }
+        if self.normalize.enabled && !self.normalize.url.is_empty() {
+            cmd.extend(["--normalize-url".into(), self.normalize.url.clone()]);
+            if !self.normalize.model.is_empty() {
+                cmd.extend(["--normalize-model".into(), self.normalize.model.clone()]);
+            }
+        }
         cmd
+    }
+
+    /// Worker env `INKVOICE_NORMALIZE_KEY`, set when normalization is on and a key is configured.
+    pub fn normalize_key(&self) -> Option<String> {
+        (self.normalize.enabled && !self.normalize.key.is_empty()).then(|| self.normalize.key.clone())
     }
 }
 
@@ -319,5 +348,24 @@ mod tests {
         c.engine = "woof".into();
         c.set_adv("temp", None);
         assert!(!c.worker_command().iter().any(|a| a == "--temp"));
+    }
+
+    #[test]
+    fn normalize_settings_reach_worker() {
+        let mut c = Config::default();
+        assert!(!c.worker_command().iter().any(|a| a.starts_with("--normalize")), "off by default");
+        c.normalize.enabled = true;
+        c.normalize.url = "http://127.0.0.1:8091/v1".into();
+        c.normalize.model = "smol".into();
+        let cmd = c.worker_command();
+        assert!(cmd.windows(2).any(|w| w[0] == "--normalize-url" && w[1] == "http://127.0.0.1:8091/v1"));
+        assert!(cmd.windows(2).any(|w| w[0] == "--normalize-model" && w[1] == "smol"));
+        c.normalize.url.clear();
+        assert!(!c.worker_command().iter().any(|a| a.starts_with("--normalize")), "no url, no flags");
+        // configs saved before the group existed still load with the defaults
+        let old: Config = serde_json::from_value(serde_json::json!({"engine": "kokoro", "sentence_pause": 0.4})).unwrap();
+        assert!(!old.normalize.enabled);
+        assert_eq!(old.normalize.url, "http://127.0.0.1:8091/v1");
+        assert!(old.normalize.model.is_empty() && old.normalize.key.is_empty());
     }
 }

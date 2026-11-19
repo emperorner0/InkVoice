@@ -19,6 +19,7 @@ use std::time::Instant;
 const WORKERS: &[(&str, &str)] = &[
     ("common.py", include_str!("../workers/common.py")),
     ("aligner.py", include_str!("../workers/aligner.py")),
+    ("normalizer.py", include_str!("../workers/normalizer.py")),
     ("phonon_worker.py", include_str!("../workers/phonon_worker.py")),
     ("woof_worker.py", include_str!("../workers/woof_worker.py")),
     ("kokoro_worker.py", include_str!("../workers/kokoro_worker.py")),
@@ -137,7 +138,7 @@ impl App {
         let cfg = Config::load();
         cfg.save();
         let (import_tx, import_rx) = channel();
-        let tts = tts::Tts::start(cfg.worker_command(), cc.egui_ctx.clone());
+        let tts = tts::Tts::start(cfg.worker_command(), cfg.normalize_key(), cc.egui_ctx.clone());
         let mut app = Self {
             lib: book::load_library(),
             open: None,
@@ -193,7 +194,7 @@ impl App {
             if let Some(e) = installer::SPECS.iter().find(|s| app.installed.contains(s.name)) {
                 app.cfg.engine = e.name.to_string();
                 app.cfg.save();
-                app.tts = tts::Tts::start(app.cfg.worker_command(), app.ctx.clone());
+                app.tts = tts::Tts::start(app.cfg.worker_command(), app.cfg.normalize_key(), app.ctx.clone());
             }
         }
         app.refresh_lib_audio();
@@ -636,7 +637,7 @@ impl App {
         self.worker_dirty = false;
         let had_jobs = !self.pending.is_empty();
         self.cancel_generation();
-        self.tts = tts::Tts::start(self.cfg.worker_command(), self.ctx.clone());
+        self.tts = tts::Tts::start(self.cfg.worker_command(), self.cfg.normalize_key(), self.ctx.clone());
         self.cfg.save();
         self.refresh_have();
         if had_jobs {

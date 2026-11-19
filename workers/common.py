@@ -16,6 +16,11 @@ silence is trimmed, pauses are inserted deliberately, and long internal silences
 Word timing is estimated, not model-reported: inside each synthesized piece, punctuation is
 matched to the pauses actually detected in the audio, and words are interpolated between
 those anchors by character length.
+
+Normalization: with --normalize-url set, normalizer.py asks an OpenAI-compatible LLM for one
+spoken token per original word of each piece (numbers, abbreviations and ambiguous words respelled).
+The spoken tokens are synthesized while every offset stays that of the original text; any failure
+falls back to the original words.
 """
 import argparse, json, os, re, sys, wave
 import numpy as np
@@ -43,6 +48,8 @@ def base_args(default_voice):
     ap.add_argument("--para-pause", type=float, default=0.60, help="gap between paragraphs (s)")
     ap.add_argument("--max-pause", type=float, default=0.45, help="shorten internal silences longer than this (s)")
     ap.add_argument("--max-chars", type=int, default=700, help="split paragraphs longer than this at sentence ends")
+    ap.add_argument("--normalize-url", default="", help="OpenAI-compatible /v1 endpoint that respells words (empty = off)")
+    ap.add_argument("--normalize-model", default="", help="model name at the normalize endpoint")
     return ap
 
 
@@ -170,7 +177,8 @@ def _atomic_write(path, write):
     os.replace(tmp, path)
 
 
-def synthesize(req_id, text, out, synth_piece, sr, args, stream=False, start_char=0, align_fn=None):
+def synthesize(req_id, text, out, synth_piece, sr, args, stream=False, start_char=0, align_fn=None,
+               normalize_fn=None):
     """Synthesize `text` to `out` (.wav + .json).
 
     stream=True: generation starts at the piece containing `start_char`, and every finished piece
@@ -225,7 +233,9 @@ def synthesize(req_id, text, out, synth_piece, sr, args, stream=False, start_cha
     for n, i in enumerate(order):
         idx, end_para = pieces[i]
         pw = [words[j] for j in idx]
-        a = np.asarray(synth_piece(texts[i]), dtype=np.float32).reshape(-1)
+        if normalize_fn is not None:  # spoken tokens in, original offsets out (see normalizer.py)
+            pw = [(cs, ce, say) for (cs, ce, _), say in zip(pw, normalize_fn(pw))]
+        a = np.asarray(synth_piece(" ".join(w for _, _, w in pw)), dtype=np.float32).reshape(-1)
         a = cap_pauses(trim(a, sr), sr, args.max_pause)
         rel = None
         if align_fn is not None:  # measured timings, when the engine can provide them
@@ -285,6 +295,12 @@ def serve(args, load):
     """load() -> (synth_piece(text) -> float32 array, sample_rate[, align_fn]). Errors are reported
     per request. The optional align_fn(piece_words, audio, sr, t0) replaces the estimated word
     timings with measured ones (see aligner.py)."""
+    normalize_fn = None
+    if args.normalize_url:  # optional LLM pass; the key never goes on the command line
+        from normalizer import make
+        normalize_fn = make(args.normalize_url, args.normalize_model,
+                            key=os.environ.get("INKVOICE_NORMALIZE_KEY"),
+                            cache_dir=os.path.join(data_dir(), "normalize-cache"))
     align_fn = None
     try:
         loaded = load()
@@ -300,7 +316,7 @@ def serve(args, load):
                 raise RuntimeError(load_err)
             offset = synthesize(req["id"], req["text"], req["out"], synth_piece, sr, args,
                                 stream=bool(req.get("stream")), start_char=int(req.get("start_char") or 0),
-                                align_fn=align_fn)
+                                align_fn=align_fn, normalize_fn=normalize_fn)
             emit({"id": req["id"], "ok": True, "stream_offset": offset})
         except Exception as e:
             emit({"id": req["id"], "error": str(e)})
