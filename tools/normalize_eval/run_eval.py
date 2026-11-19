@@ -1,10 +1,17 @@
-"""Measure workers/normalizer.py against cases.jsonl on a running OpenAI-compatible server.
+"""Measure workers/normalizer.py against cases.jsonl.
 
-Usage: python tools/normalize_eval/run_eval.py --url http://127.0.0.1:8091/v1 --model <name>
-The optional API key comes from INKVOICE_NORMALIZE_KEY, as for the workers. The disk cache is
-disabled here so every case exercises the server. Each case is one piece; per category this
-reports the share of expected changes made correctly, false changes on words that must stay
-unchanged, invalid or discarded replies, and latency p50/p95 per piece. Spoken forms are compared
+Usage:
+  python tools/normalize_eval/run_eval.py --mode rules
+  python tools/normalize_eval/run_eval.py --mode hybrid --url http://127.0.0.1:8091/v1 --model <name>
+  python tools/normalize_eval/run_eval.py --mode llm --url http://127.0.0.1:8091/v1 --model <name>
+
+--mode rules runs the deterministic rule layer alone (no server needed), llm is the
+pre-hybrid behaviour with the rules off, and hybrid is what the workers run. The
+optional API key comes from INKVOICE_NORMALIZE_KEY, as for the workers. The disk cache
+is disabled here so every case exercises the layer under test. Each case is one piece;
+per category this reports the share of expected changes made correctly, false changes
+on words that must stay unchanged, invalid or discarded replies, the share of pieces
+that needed an LLM call, and latency p50/p95 per piece. Spoken forms are compared
 case-insensitively with hyphens treated as spaces.
 """
 import argparse
@@ -49,15 +56,20 @@ def pctile(xs, p):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--url", required=True, help="OpenAI-compatible endpoint ending in /v1")
-    ap.add_argument("--model", required=True)
+    ap.add_argument("--mode", choices=["hybrid", "rules", "llm"], default="hybrid")
+    ap.add_argument("--url", default="", help="OpenAI-compatible endpoint ending in /v1")
+    ap.add_argument("--model", default="")
     ap.add_argument("--cases", default=str(Path(__file__).resolve().parent / "cases.jsonl"))
     ap.add_argument("--timeout", type=float, default=20.0)
     args = ap.parse_args()
+    if args.mode != "rules" and not (args.url and args.model):
+        ap.error(f"--url and --model are required for --mode {args.mode}")
 
+    sys.path.insert(0, str(ROOT / "workers"))
     normalizer = load_normalizer()
-    normalize = normalizer.make(args.url, args.model, key=os.environ.get("INKVOICE_NORMALIZE_KEY"),
-                                timeout=args.timeout)
+    normalize = normalizer.make("" if args.mode == "rules" else args.url, args.model,
+                                key=os.environ.get("INKVOICE_NORMALIZE_KEY"), timeout=args.timeout,
+                                rules=args.mode != "llm")
     stats = normalize.stats
 
     cases = [json.loads(l) for l in open(args.cases, encoding="utf-8") if l.strip()]
@@ -95,7 +107,7 @@ def main():
             acc["discarded"] += int(discarded)
             acc["lat"].append(dt)
 
-    print(f"model: {args.model}  cases: {len(cases)}  words: {overall['words']}")
+    print(f"mode: {args.mode}  model: {args.model}  cases: {len(cases)}  words: {overall['words']}")
     hdr = f"{'category':<14}{'cases':>6}{'exp':>5}{'ok':>5}{'share':>8}{'false':>7}{'disc':>6}{'p50ms':>8}{'p95ms':>8}"
     print(hdr)
     print("-" * len(hdr))
@@ -109,6 +121,8 @@ def main():
     print(f"{'overall':<14}{len(cases):>6}{overall['expected']:>5}{overall['correct']:>5}{share:>8.0%}"
           f"{overall['false']:>7}{overall['discarded']:>6}"
           f"{pctile(overall['lat'], 50):>8.0f}{pctile(overall['lat'], 95):>8.0f}")
+    print(f"pieces needing an LLM call: {stats['residue']} of {stats['pieces']} "
+          f"({stats['residue'] / stats['pieces']:.0%}), requests made: {stats['calls']}")
     wrong = [w for d in per.values() for w in d["wrong"]]
     if wrong:
         print(f"\nmisses and false changes ({len(wrong)}):")

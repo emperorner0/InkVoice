@@ -7,3 +7,5 @@
 __pycache__/
 *.pyc
 /dist
+# tools/normalize_eval homograph dataset download cache
+tools/normalize_eval/homograph-cache/

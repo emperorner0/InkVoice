@@ -15,7 +15,7 @@
 {"category": "money", "text": "Lunch came to $9.50 with the coffee included.", "changes": {"3": ["nine dollars and fifty cents", "nine dollars fifty", "nine fifty"]}}
 {"category": "money", "text": "The repair cost $1,200 and took a week.", "changes": {"3": ["one thousand two hundred", "one thousand two hundred dollars", "twelve hundred dollars"]}}
 {"category": "money", "text": "Tickets sold for $19.99 at the door.", "changes": {"3": ["nineteen dollars and ninety nine cents", "nineteen dollars ninety nine", "nineteen ninety nine"]}}
-{"category": "money", "text": "The foundation grant totalled $2.4 million over three years.", "changes": {"4": ["two point four"]}}
+{"category": "money", "text": "The foundation grant totalled $2.4 million over three years.", "changes": {"4": ["two point four"], "5": ["million dollars"]}}
 {"category": "money", "text": "A deposit of $500 held the appointment.", "changes": {"3": ["five hundred dollars"]}}
 {"category": "money", "text": "Interest added 10% each year on the balance.", "changes": {"2": ["ten percent"]}}
 {"category": "money", "text": "He paid $9.50 and added a 10% tip for the server.", "changes": {"2": ["nine dollars and fifty cents", "nine dollars fifty", "nine fifty"], "6": ["ten percent"]}}
@@ -30,7 +30,7 @@
 {"category": "times", "text": "The train leaves at 3:30 in the afternoon.", "changes": {"4": ["three thirty"]}}
 {"category": "times", "text": "We closed the shop at 11:45 sharp.", "changes": {"5": ["eleven forty five"]}}
 {"category": "times", "text": "The ferry docks at 9:15 on weekdays.", "changes": {"4": ["nine fifteen"]}}
-{"category": "times", "text": "Her alarm goes off at 6 a.m. every morning.", "changes": {"6": ["a em", "a m", "ay em"]}}
+{"category": "times", "text": "Her alarm goes off at 6 a.m. every morning.", "changes": {"5": ["six"], "6": ["a em", "a m", "ay em"]}}
 {"category": "times", "text": "The last bus runs at 10:05 from the depot.", "changes": {"5": ["ten five", "ten oh five"]}}
 {"category": "decimals", "text": "The battery was down to 12% by evening.", "changes": {"5": ["twelve percent"]}}
 {"category": "decimals", "text": "The oven was set to 350° for the second batch.", "changes": {"5": ["three fifty", "three hundred fifty degrees"]}}
@@ -74,3 +74,20 @@
 {"category": "control", "text": "A gray cat slept on the porch steps.", "changes": {}}
 {"category": "control", "text": "The letters arrived in a bundle tied with string.", "changes": {}}
 {"category": "control", "text": "She kept her answers short and her voice level.", "changes": {}}
+{"category": "dates", "text": "The archive holds a ledger from 1898 describing the first flood.", "changes": {"6": ["eighteen ninety eight"]}}
+{"category": "dates", "text": "The ledger lists 1500 households in the older district.", "changes": {"3": ["one thousand five hundred", "fifteen hundred"]}}
+{"category": "money", "text": "The estate sold for $10 million at the spring auction.", "changes": {"4": ["ten"], "5": ["million dollars"]}}
+{"category": "money", "text": "Membership grew (up 12%) despite the higher fees.", "changes": {"3": ["twelve percent"]}}
+{"category": "money", "text": "The crowd was estimated at 25,000 by the local paper.", "changes": {"5": ["twenty five thousand"]}}
+{"category": "abbreviations", "text": "St. Michael's Church faces the end of Alder St.", "changes": {"0": ["saint"], "8": ["street"]}}
+{"category": "abbreviations", "text": "The harvest festival was moved to Sept. after the audit.", "changes": {"6": ["september"]}}
+{"category": "ordinals", "text": "Her thesis covered the causes of World War II in Europe.", "changes": {"8": ["two"]}}
+{"category": "ordinals", "text": "Read the notes at the end of Part III before you begin.", "changes": {"8": ["three", "third"]}}
+{"category": "times", "text": "The night shift clocks out at 2:00 on Saturdays.", "changes": {"6": ["two o'clock", "two o clock", "two hundred"]}}
+{"category": "calibers", "text": "He reloaded the .38 and counted 3 remaining shells.", "changes": {"3": ["thirty eight"], "6": ["three"]}}
+{"category": "decimals", "text": "The recipe calls for 6 eggs and a pinch of salt.", "changes": {"4": ["six"]}}
+{"category": "calibers", "text": "The rifle was threaded for a .308 brake.", "changes": {"6": ["three oh eight"]}}
+{"category": "decimals", "text": "The dose measured .05 milliliters in the small syringe.", "changes": {"3": ["point zero five"]}}
+{"category": "dates", "text": "The cottage was wired for power in 2008.", "changes": {"7": ["two thousand eight"]}}
+{"category": "control", "text": "The kids on the corner called him Tom.", "changes": {}}
+{"category": "abbreviations", "text": "They turned onto Baker St. He waved once from the porch.", "changes": {"4": ["street"]}}
