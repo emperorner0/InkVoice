@@ -84,6 +84,29 @@ pub const WOOF_PARAMS: &[Param] = &[
 
 pub const KOKORO_PARAMS: &[Param] = &[PIECE];
 
+/// Qwen3 clones a reference voice: each voice is a folder <data>/voices/<name>/ (ref.wav + ref.txt).
+pub const QWEN3_VOICES: &[&str] = &["narrator"];
+pub const QWEN3_PARAMS: &[Param] = &[
+    Param {
+        flag: "model",
+        label: "Model size",
+        help: "0.6B is faster and uses about 3 GB of GPU memory. 1.7B follows the voice sample more closely and uses about 5 GB.",
+        kind: Kind::Choice { options: &[("0.6B", "0.6B (faster)"), ("1.7B", "1.7B (closer to the sample)")], default: 0 },
+    },
+    Param {
+        flag: "temperature",
+        label: "Temperature",
+        help: "Randomness of the delivery. Lower = steadier, higher = livelier but more mistakes. Qwen3 default 0.9.",
+        kind: Kind::Float { min: 0.3, max: 1.2, step: 0.05, default: 0.9 },
+    },
+    Param {
+        flag: "max-chars",
+        label: "Text per generation step",
+        help: "Longest stretch of text (characters) synthesized in one go. Longer = more natural flow, but the cloned voice can drift. Qwen3 default 400.",
+        kind: Kind::Int { min: 150, max: 800, default: 400 },
+    },
+];
+
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(default)]
 pub struct Config {
@@ -122,10 +145,17 @@ impl Default for Config {
         engines.insert("phonon".to_string(), cmd("phonon_worker.py"));
         engines.insert("woof".to_string(), cmd("woof_worker.py"));
         engines.insert("kokoro".to_string(), cmd("kokoro_worker.py"));
+        // Qwen3 needs PyTorch + CUDA, which lives in its own environment
+        let qpy = crate::installer::python_in("venv-qwen3");
+        engines.insert(
+            "qwen3".to_string(),
+            vec![qpy.to_string_lossy().into(), d.join("workers").join("qwen3_worker.py").to_string_lossy().into()],
+        );
         let mut voices = BTreeMap::new();
         voices.insert("phonon".to_string(), "Everly".to_string());
         voices.insert("woof".to_string(), "juno".to_string());
         voices.insert("kokoro".to_string(), "af_heart".to_string());
+        voices.insert("qwen3".to_string(), "narrator".to_string());
         Config {
             engine: "kokoro".into(),
             engines,
@@ -183,6 +213,7 @@ impl Config {
             "phonon" => PHONON_VOICES,
             "woof" => WOOF_VOICES,
             "kokoro" => KOKORO_VOICES,
+            "qwen3" => QWEN3_VOICES,
             _ => &[],
         }
     }
@@ -192,6 +223,7 @@ impl Config {
             "phonon" => PHONON_PARAMS,
             "woof" => WOOF_PARAMS,
             "kokoro" => KOKORO_PARAMS,
+            "qwen3" => QWEN3_PARAMS,
             _ => &[],
         }
     }

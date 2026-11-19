@@ -170,7 +170,7 @@ def _atomic_write(path, write):
     os.replace(tmp, path)
 
 
-def synthesize(req_id, text, out, synth_piece, sr, args, stream=False, start_char=0):
+def synthesize(req_id, text, out, synth_piece, sr, args, stream=False, start_char=0, align_fn=None):
     """Synthesize `text` to `out` (.wav + .json).
 
     stream=True: generation starts at the piece containing `start_char`, and every finished piece
@@ -227,7 +227,14 @@ def synthesize(req_id, text, out, synth_piece, sr, args, stream=False, start_cha
         pw = [words[j] for j in idx]
         a = np.asarray(synth_piece(texts[i]), dtype=np.float32).reshape(-1)
         a = cap_pauses(trim(a, sr), sr, args.max_pause)
-        rel = align(pw, a, sr, 0.0)
+        rel = None
+        if align_fn is not None:  # measured timings, when the engine can provide them
+            try:
+                rel = align_fn(pw, a, sr, 0.0)
+            except Exception as e:
+                print(f"word alignment failed for one piece, estimating instead: {e}", file=sys.stderr)
+        if rel is None:
+            rel = align(pw, a, sr, 0.0)
         gap = np.zeros(int(sr * (args.para_pause if end_para else args.sentence_pause)), dtype=np.float32)
         made[i] = (a, gap, rel)
         done += len(texts[i])
@@ -275,9 +282,14 @@ def synthesize(req_id, text, out, synth_piece, sr, args, stream=False, start_cha
 
 
 def serve(args, load):
-    """load() -> (synth_piece(text) -> float32 array, sample_rate). Errors are reported per request."""
+    """load() -> (synth_piece(text) -> float32 array, sample_rate[, align_fn]). Errors are reported
+    per request. The optional align_fn(piece_words, audio, sr, t0) replaces the estimated word
+    timings with measured ones (see aligner.py)."""
+    align_fn = None
     try:
-        synth_piece, sr = load()
+        loaded = load()
+        synth_piece, sr = loaded[0], loaded[1]
+        align_fn = loaded[2] if len(loaded) > 2 else None
         load_err = None
     except Exception as e:  # report on every request instead of dying silently
         synth_piece, sr, load_err = None, 0, f"model failed to load: {e}"
@@ -287,7 +299,8 @@ def serve(args, load):
             if load_err:
                 raise RuntimeError(load_err)
             offset = synthesize(req["id"], req["text"], req["out"], synth_piece, sr, args,
-                                stream=bool(req.get("stream")), start_char=int(req.get("start_char") or 0))
+                                stream=bool(req.get("stream")), start_char=int(req.get("start_char") or 0),
+                                align_fn=align_fn)
             emit({"id": req["id"], "ok": True, "stream_offset": offset})
         except Exception as e:
             emit({"id": req["id"], "error": str(e)})

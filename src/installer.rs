@@ -23,6 +23,12 @@ pub struct Spec {
     pub license: &'static str,
     /// Python packages
     pip: &'static [&'static str],
+    /// extra `uv pip install` options (e.g. picking the CUDA build of PyTorch)
+    pip_opts: &'static [&'static str],
+    /// folder (inside the data folder) of the Python environment the engine runs in
+    venv: &'static str,
+    /// folder inside the data folder that must exist once the model has been fetched
+    probe_dir: Option<&'static str>,
     /// package folder that proves the packages are installed
     probe_pkg: &'static str,
     /// (url, path inside the data folder)
@@ -48,6 +54,9 @@ pub const SPECS: &[Spec] = &[
         size: "115 MB",
         license: "Apache-2.0",
         pip: &["kokoro-onnx", "numpy"],
+        pip_opts: &[],
+        venv: "venv",
+        probe_dir: None,
         probe_pkg: "kokoro_onnx",
         files: &[
             (concat!("https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/", "kokoro-v1.0.int8.onnx"), "models/kokoro/kokoro-v1.0.int8.onnx"),
@@ -64,6 +73,9 @@ pub const SPECS: &[Spec] = &[
         size: "125 MB",
         license: "Apache-2.0",
         pip: &["ptts", "numpy"],
+        pip_opts: &[],
+        venv: "venv",
+        probe_dir: None,
         probe_pkg: "ptts",
         files: &[],
         warmup: Some("import ptts; ptts.TTS(lang='en', voice='Everly'); print('ready')"),
@@ -77,6 +89,9 @@ pub const SPECS: &[Spec] = &[
         size: "41 MB",
         license: "Non-commercial",
         pip: &["numpy"],
+        pip_opts: &[],
+        venv: "venv",
+        probe_dir: None,
         probe_pkg: "numpy",
         files: &[
             woof!("woof_int8.npz"),
@@ -94,18 +109,40 @@ pub const SPECS: &[Spec] = &[
         pip_mb: 16.0,
         warmup_mb: 0.0,
     },
+    Spec {
+        name: "qwen3",
+        title: "Qwen3 (cloned voice)",
+        blurb: "Expressive narration in a custom voice cloned from a short sample. Needs an NVIDIA GPU (about 3 GB of GPU memory).",
+        size: "7 GB",
+        license: "Apache-2.0",
+        // transformers is pinned: faster-qwen3-tts 0.5.4 fails to load its models on 5.23
+        pip: &["torch", "torchaudio", "faster-qwen3-tts==0.5.4", "transformers==5.15.1", "soundfile", "numpy"],
+        pip_opts: &["--torch-backend", "auto"],
+        venv: "venv-qwen3",
+        probe_dir: Some("hf/hub/models--Qwen--Qwen3-TTS-12Hz-0.6B-Base"),
+        probe_pkg: "faster_qwen3_tts",
+        files: &[],
+        warmup: Some("from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-TTS-12Hz-0.6B-Base'); snapshot_download('facebook/wav2vec2-base-960h', allow_patterns=['*.json', '*.txt', 'model.safetensors']); print('ready')"),
+        pip_mb: 4500.0,
+        warmup_mb: 2500.0,
+    },
 ];
 pub fn spec(name: &str) -> Option<&'static Spec> {
     SPECS.iter().find(|s| s.name == name)
 }
 
 pub fn venv_python() -> PathBuf {
-    let v = data_dir().join("venv");
+    python_in("venv")
+}
+
+/// The Python of one of InkVoice's environments (`venv` is a folder inside the data folder).
+pub fn python_in(venv: &str) -> PathBuf {
+    let v = data_dir().join(venv);
     if cfg!(windows) { v.join("Scripts").join("python.exe") } else { v.join("bin").join("python") }
 }
 
-fn site_packages() -> Vec<PathBuf> {
-    let v = data_dir().join("venv");
+fn site_packages(venv: &str) -> Vec<PathBuf> {
+    let v = data_dir().join(venv);
     let mut out = vec![v.join("Lib").join("site-packages")];
     if let Ok(rd) = std::fs::read_dir(v.join("lib")) {
         out.extend(rd.flatten().map(|e| e.path().join("site-packages")));
@@ -116,11 +153,11 @@ fn site_packages() -> Vec<PathBuf> {
 pub fn is_installed(name: &str) -> bool {
     let Some(s) = spec(name) else { return false };
     // engines that fetch weights at warm-up keep them in <data>/hf
-    if s.warmup.is_some() && !data_dir().join("hf").is_dir() {
+    if s.warmup.is_some() && !data_dir().join(s.probe_dir.unwrap_or("hf")).is_dir() {
         return false;
     }
-    venv_python().exists()
-        && site_packages().iter().any(|sp| sp.join(s.probe_pkg).is_dir())
+    python_in(s.venv).exists()
+        && site_packages(s.venv).iter().any(|sp| sp.join(s.probe_pkg).is_dir())
         && s.files.iter().all(|(_, rel)| data_dir().join(rel).is_file())
 }
 
@@ -128,8 +165,24 @@ pub fn is_installed(name: &str) -> bool {
 pub fn remove(name: &str) {
     let d = data_dir();
     match name {
+        "qwen3" => {
+            let _ = std::fs::remove_dir_all(d.join("venv-qwen3"));
+            for e in std::fs::read_dir(d.join("hf").join("hub")).into_iter().flatten().flatten() {
+                if e.file_name().to_string_lossy().starts_with("models--Qwen--") {
+                    let _ = std::fs::remove_dir_all(e.path());
+                }
+            }
+        }
         "phonon" => {
-            let _ = std::fs::remove_dir_all(d.join("hf"));
+            // everything fetched from Hugging Face except other engines' models
+            for e in std::fs::read_dir(d.join("hf").join("hub")).into_iter().flatten().flatten() {
+                if !e.file_name().to_string_lossy().starts_with("models--Qwen--") {
+                    let _ = std::fs::remove_dir_all(e.path());
+                }
+            }
+            if !is_installed("qwen3") {
+                let _ = std::fs::remove_dir_all(d.join("hf"));
+            }
             if let Some(py) = venv_python().to_str() {
                 let _ = uv_cmd(&["pip", "uninstall", "--python", py, "ptts"]).output();
             }
@@ -249,9 +302,11 @@ fn cleanup_partial() {
     let d = data_dir();
     walk(&d.join("models"));
     walk(&d.join("tools"));
-    let venv = d.join("venv");
-    if venv.is_dir() && !venv_python().exists() {
-        let _ = std::fs::remove_dir_all(venv);
+    for s in SPECS {
+        let venv = d.join(s.venv);
+        if venv.is_dir() && !python_in(s.venv).exists() {
+            let _ = std::fs::remove_dir_all(venv);
+        }
     }
 }
 
@@ -273,7 +328,7 @@ fn run(name: &str, ctl: &mut Ctl) -> Result<(), String> {
     if !uv_path().exists() {
         plan.push((StepInfo { label: "Download the installer tool (uv)".into(), weight: 18.0 }, Task::Uv));
     }
-    if !venv_python().exists() {
+    if !python_in(s.venv).exists() {
         plan.push((StepInfo { label: "Set up a private Python".into(), weight: 33.0 }, Task::Python));
     }
     plan.push((StepInfo { label: format!("Install {} software", s.title), weight: s.pip_mb }, Task::Packages));
@@ -301,18 +356,19 @@ fn run(name: &str, ctl: &mut Ctl) -> Result<(), String> {
         match task {
             Task::Uv => get_uv(ctl)?,
             Task::Python => {
-                let venv = d.join("venv");
+                let venv = d.join(s.venv);
                 run_uv(uv_cmd(&["venv", "--python", PYTHON, venv.to_str().unwrap()]), ctl)?;
             }
             Task::Packages => {
-                let py = venv_python();
+                let py = python_in(s.venv);
                 let mut args = vec!["pip", "install", "--python", py.to_str().unwrap()];
+                args.extend(s.pip_opts);
                 args.extend(s.pip);
                 run_uv(uv_cmd(&args), ctl)?;
             }
             Task::Files(files) => download_all(&files, ctl)?,
             Task::Warmup => {
-                let mut c = Command::new(venv_python());
+                let mut c = Command::new(python_in(s.venv));
                 c.args(["-c", s.warmup.unwrap()]).env("HF_HOME", d.join("hf")).env("INKVOICE_DATA", &d);
                 run_watching_dir(c, &d.join("hf"), s.warmup_mb * 1e6, ctl)?;
             }

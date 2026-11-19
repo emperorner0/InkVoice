@@ -18,9 +18,11 @@ use std::time::Instant;
 
 const WORKERS: &[(&str, &str)] = &[
     ("common.py", include_str!("../workers/common.py")),
+    ("aligner.py", include_str!("../workers/aligner.py")),
     ("phonon_worker.py", include_str!("../workers/phonon_worker.py")),
     ("woof_worker.py", include_str!("../workers/woof_worker.py")),
     ("kokoro_worker.py", include_str!("../workers/kokoro_worker.py")),
+    ("qwen3_worker.py", include_str!("../workers/qwen3_worker.py")),
 ];
 
 #[derive(PartialEq, Clone, Copy)]
