@@ -1,0 +1,76 @@
+{"category": "calibers", "text": "He kept two .45s locked in the drawer under the register.", "changes": {"3": ["forty fives"]}}
+{"category": "calibers", "text": "The sidearm was a 9mm with a worn blue finish.", "changes": {"4": ["nine mil", "nine millimeter", "nine millimeters"]}}
+{"category": "calibers", "text": "Each rifle was chambered for 5.56 and zeroed at a hundred meters.", "changes": {"5": ["five fifty six", "five five six", "five point five six"]}}
+{"category": "calibers", "text": "His grandfather had carried a .30-06 through two winters in the mountains.", "changes": {"5": ["thirty aught six", "thirty oh six", "thirty ought six", "thirty zero six"]}}
+{"category": "calibers", "text": "A 12-gauge leaned behind the kitchen door for years.", "changes": {"1": ["twelve gauge"]}}
+{"category": "calibers", "text": "The detective preferred the .357 because it never jammed.", "changes": {"4": ["three fifty seven", "three five seven"]}}
+{"category": "decimals", "text": "The parcel weighed 3.5 ounces more than the scale allowed.", "changes": {"3": ["three and a half", "three point five"]}}
+{"category": "decimals", "text": "Rainfall totalled 62.4 percent of the seasonal average.", "changes": {"2": ["sixty two point four"]}}
+{"category": "decimals", "text": "Add 0.5 liters of water and stir once.", "changes": {"1": ["point five", "zero point five"]}}
+{"category": "decimals", "text": "The trail climbed for 1.5 kilometers before flattening out.", "changes": {"4": ["one point five"]}}
+{"category": "decimals", "text": "The gap measured 2.75 inches at its narrowest.", "changes": {"3": ["two and three quarters", "two point seven five", "two seventy five"]}}
+{"category": "decimals", "text": "The shutter stayed open for 0.9 seconds.", "changes": {"5": ["point nine", "zero point nine"]}}
+{"category": "decimals", "text": "The beams spanned 17.4 meters from wall to wall.", "changes": {"3": ["seventeen point four"]}}
+{"category": "decimals", "text": "The old engine still lifted 4.2 tons of gravel.", "changes": {"5": ["four point two"]}}
+{"category": "money", "text": "Lunch came to $9.50 with the coffee included.", "changes": {"3": ["nine dollars and fifty cents", "nine dollars fifty", "nine fifty"]}}
+{"category": "money", "text": "The repair cost $1,200 and took a week.", "changes": {"3": ["one thousand two hundred", "one thousand two hundred dollars", "twelve hundred dollars"]}}
+{"category": "money", "text": "Tickets sold for $19.99 at the door.", "changes": {"3": ["nineteen dollars and ninety nine cents", "nineteen dollars ninety nine", "nineteen ninety nine"]}}
+{"category": "money", "text": "The foundation grant totalled $2.4 million over three years.", "changes": {"4": ["two point four"]}}
+{"category": "money", "text": "A deposit of $500 held the appointment.", "changes": {"3": ["five hundred dollars"]}}
+{"category": "money", "text": "Interest added 10% each year on the balance.", "changes": {"2": ["ten percent"]}}
+{"category": "money", "text": "He paid $9.50 and added a 10% tip for the server.", "changes": {"2": ["nine dollars and fifty cents", "nine dollars fifty", "nine fifty"], "6": ["ten percent"]}}
+{"category": "dates", "text": "The stamp on the folder said \"1984\" in red ink.", "changes": {"6": ["nineteen eighty four"]}}
+{"category": "dates", "text": "The diary began in 1984 and ran for nine volumes.", "changes": {"4": ["nineteen eighty four"]}}
+{"category": "dates", "text": "The bridge has carried traffic since 1776.", "changes": {"6": ["seventeen seventy six"]}}
+{"category": "dates", "text": "The company charter dates to 1900.", "changes": {"5": ["nineteen hundred"]}}
+{"category": "dates", "text": "The observatory reopened in 2001 after the storm.", "changes": {"4": ["twenty oh one", "two thousand and one", "two thousand one"]}}
+{"category": "dates", "text": "The first ship logged the coast in 1492.", "changes": {"7": ["fourteen ninety two"]}}
+{"category": "dates", "text": "The crowd gathered on July 4, 1776 to watch the fireworks.", "changes": {"5": ["four", "fourth"], "6": ["seventeen seventy six"]}}
+{"category": "dates", "text": "The ledger closed with a balance of 12% interest.", "changes": {"7": ["twelve percent"]}}
+{"category": "times", "text": "The train leaves at 3:30 in the afternoon.", "changes": {"4": ["three thirty"]}}
+{"category": "times", "text": "We closed the shop at 11:45 sharp.", "changes": {"5": ["eleven forty five"]}}
+{"category": "times", "text": "The ferry docks at 9:15 on weekdays.", "changes": {"4": ["nine fifteen"]}}
+{"category": "times", "text": "Her alarm goes off at 6 a.m. every morning.", "changes": {"6": ["a em", "a m", "ay em"]}}
+{"category": "times", "text": "The last bus runs at 10:05 from the depot.", "changes": {"5": ["ten five", "ten oh five"]}}
+{"category": "decimals", "text": "The battery was down to 12% by evening.", "changes": {"5": ["twelve percent"]}}
+{"category": "decimals", "text": "The oven was set to 350° for the second batch.", "changes": {"5": ["three fifty", "three hundred fifty degrees"]}}
+{"category": "calibers", "text": "The crate was stenciled (5.56 ball) in faded paint.", "changes": {"4": ["five fifty six", "five five six", "five point five six"]}}
+{"category": "ordinals", "text": "The letter opened with CHAPTER IV in small capitals.", "changes": {"5": ["four", "fourth"]}}
+{"category": "ordinals", "text": "The portrait showed Henry VIII in ceremonial armor.", "changes": {"4": ["eighth", "the eighth"]}}
+{"category": "ordinals", "text": "They lived on the 3rd floor of the brick building.", "changes": {"4": ["third"]}}
+{"category": "ordinals", "text": "Elizabeth II visited the old mill during her tour.", "changes": {"1": ["second", "the second"]}}
+{"category": "ordinals", "text": "The 21st of June was the longest day of the year.", "changes": {"1": ["twenty first"]}}
+{"category": "ordinals", "text": "His notes ended at CHAPTER XIV with a ragged line.", "changes": {"5": ["fourteen", "fourteenth"]}}
+{"category": "ordinals", "text": "The 1st battalion marched out before dawn.", "changes": {"1": ["first"]}}
+{"category": "abbreviations", "text": "Dr. Ansley arrived before the ambulance did.", "changes": {"0": ["doctor"]}}
+{"category": "abbreviations", "text": "Sgt. Crowe counted the rifles twice before lockup.", "changes": {"0": ["sergeant"]}}
+{"category": "abbreviations", "text": "They lit candles in the chapel of St. Aldric.", "changes": {"7": ["saint"]}}
+{"category": "abbreviations", "text": "The road switchbacked up Mt. Hollow all morning.", "changes": {"4": ["mount"]}}
+{"category": "abbreviations", "text": "The challenger won three sets vs. the reigning champion.", "changes": {"5": ["versus"]}}
+{"category": "abbreviations", "text": "Capt. Marsh ordered the anchors dropped at once.", "changes": {"0": ["captain"]}}
+{"category": "abbreviations", "text": "Prof. Weldon erased the board and sighed.", "changes": {"0": ["professor"]}}
+{"category": "abbreviations", "text": "A young Lt. saluted at the gate and hurried on.", "changes": {"2": ["lieutenant"]}}
+{"category": "abbreviations", "text": "The patrol was led by a young Lt.", "changes": {"7": ["lieutenant"]}}
+{"category": "abbreviations", "text": "The guest list was signed off by a retired Sgt.", "changes": {"9": ["sergeant"]}}
+{"category": "heteronyms", "text": "Yesterday he read the whole will aloud to the family.", "changes": {"2": ["red"]}}
+{"category": "heteronyms", "text": "The old pipes were made of lead and had to go.", "changes": {"6": ["led"]}}
+{"category": "heteronyms", "text": "The concert was broadcast live from the small theater.", "changes": {"4": ["lyve"]}}
+{"category": "heteronyms", "text": "The clock wound down sometime before dawn.", "changes": {"2": ["wowned"]}}
+{"category": "heteronyms", "text": "She read the telegram twice before answering.", "changes": {"1": ["red"]}}
+{"category": "heteronyms", "text": "The pencils used a harder lead than the ones at school.", "changes": {"5": ["led"]}}
+{"category": "heteronyms", "text": "The studio audience kept the show live all evening.", "changes": {"6": ["lyve"]}}
+{"category": "heteronyms", "text": "He wound the film forward to the last frame.", "changes": {"1": ["wowned"]}}
+{"category": "control", "text": "The wind rattled the shutters all night.", "changes": {}}
+{"category": "control", "text": "A single tear slid down her cheek.", "changes": {}}
+{"category": "control", "text": "The gift was wrapped and finished with a red bow.", "changes": {}}
+{"category": "control", "text": "The sails snapped in the wind as the boat turned.", "changes": {}}
+{"category": "control", "text": "She will lead the new team starting in autumn.", "changes": {}}
+{"category": "control", "text": "The nurse dressed the wound on his forearm.", "changes": {}}
+{"category": "control", "text": "The morning was calm and the coffee was strong.", "changes": {}}
+{"category": "control", "text": "He wrote letters until the lamp burned low.", "changes": {}}
+{"category": "control", "text": "The library closed early on Sundays.", "changes": {}}
+{"category": "control", "text": "Rain softened the dust along the fence line.", "changes": {}}
+{"category": "control", "text": "The kettle whistled while the bread toasted.", "changes": {}}
+{"category": "control", "text": "A gray cat slept on the porch steps.", "changes": {}}
+{"category": "control", "text": "The letters arrived in a bundle tied with string.", "changes": {}}
+{"category": "control", "text": "She kept her answers short and her voice level.", "changes": {}}
