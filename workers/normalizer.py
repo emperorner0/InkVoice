@@ -239,6 +239,17 @@ def _cache_path(cache_dir, key):
     return os.path.join(cache_dir, hashlib.sha256(key.encode("utf-8")).hexdigest()[:32] + ".json")
 
 
+def _stamp(path):
+    """(mtime, size) of the pronunciations file, or None while it does not exist."""
+    if not path:
+        return None
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_size)
+
+
 def make(url, model="", key=None, cache_dir=None, timeout=20.0, rules=True, pronounce=None):
     """Build the `normalize(piece_words) -> list[str]` function described in the docstring."""
     endpoint = url.rstrip("/") + "/chat/completions" if url else None
@@ -246,6 +257,16 @@ def make(url, model="", key=None, cache_dir=None, timeout=20.0, rules=True, pron
     if key:
         headers["Authorization"] = "Bearer " + key
     table = spoken_rules.load_table(pronounce) if rules else {}  # the user's own pronunciations
+    stamp = [_stamp(pronounce)]  # the state the table was loaded from; None = no file yet
+
+    def refresh():
+        """Reload the pronunciations when the file changed; no engine restart needed."""
+        now = _stamp(pronounce)
+        if now != stamp[0]:
+            stamp[0] = now
+            table.clear()
+            table.update(spoken_rules.load_table(pronounce))
+
     level = [0]     # remembered request decoration: json_schema > json_object > plain
     failed = [0]    # consecutive failed requests; three open the breaker below
     broken = [False]
@@ -300,6 +321,7 @@ def make(url, model="", key=None, cache_dir=None, timeout=20.0, rules=True, pron
         out = list(words)
         kinds = [(spoken_rules.KEEP, None)] * len(words)
         if rules:
+            refresh()  # an edited table applies to the next piece, whenever it arrives
             kinds = spoken_rules.apply(words, table)
             for i, (kind, say) in enumerate(kinds):
                 if kind in (spoken_rules.SETTLED, spoken_rules.DEFAULT) and say:

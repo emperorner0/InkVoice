@@ -119,6 +119,14 @@ enum Act {
     GoChapter(usize),
     GenerateAll,
     Regenerate(usize),
+    /// speak this spoken form once ("hear it")
+    HearForm(String),
+    /// commit a new spoken form for table row `row`
+    PronSet(usize, String),
+    PronRemove(usize),
+    PronAdd(String, String),
+    /// regenerate the chapters offered after a pronunciation change
+    PronRegen,
 }
 
 impl App {
@@ -140,6 +148,30 @@ impl App {
             Some(Act::GoChapter(i)) => self.go(i, 0),
             Some(Act::GenerateAll) => self.generate_all(),
             Some(Act::Regenerate(ch)) => self.regenerate_chapter(ch),
+            Some(Act::HearForm(say)) => self.hear_form(&say),
+            Some(Act::PronSet(row, say)) => {
+                // the word comes from the saved row, so a hand edit between frames cannot
+                // redirect the change onto another entry
+                let word = self.pron.entries.get(row).map(|(w, _)| w.clone());
+                match word.map(|w| self.pron_set(&w, &say, false)) {
+                    Some(Ok(_)) => {}
+                    Some(Err(e)) => self.pron_err = Some((Some(row), e)),
+                    None => {}
+                }
+            }
+            Some(Act::PronRemove(row)) => self.pron_remove(row),
+            Some(Act::PronAdd(word, say)) => {
+                self.pron_err = None;
+                if let Err(e) = self.pron_set(&word, &say, false) {
+                    self.pron_err = Some((None, e));
+                } else {
+                    self.ctx.data_mut(|d| {
+                        d.remove_temp::<String>(egui::Id::new("pron-add-word"));
+                        d.remove_temp::<String>(egui::Id::new("pron-add-say"));
+                    });
+                }
+            }
+            Some(Act::PronRegen) => self.accept_regen_offer(),
             None => {}
         }
     }
@@ -186,7 +218,9 @@ impl App {
             if k[8] { self.next_page(); }
         }
         if k[9] {
-            if self.show_settings {
+            if self.pron_win.is_some() {
+                self.close_pron_win();
+            } else if self.show_settings {
                 self.show_settings = false;
                 self.apply_worker_settings();
                 self.cfg.save();
@@ -224,6 +258,7 @@ impl App {
             }
         }
         self.settings_window(ctx);
+        self.pron_window(ctx);
         self.install_window(ctx);
         self.toast(ctx);
     }
@@ -711,6 +746,8 @@ impl App {
 
         let mut nav = 0i32;
         let mut click_char = None;
+        let mut set_pron = None;
+        let helper_on = self.cfg.normalize.enabled;
         let mut scroll = egui::ScrollArea::vertical().auto_shrink([false, false]).id_salt(("page", ch, pg));
         if self.scroll_top {
             scroll = scroll.vertical_scroll_offset(0.0);
@@ -731,14 +768,34 @@ impl App {
                         ui.add_space(14.0);
                     }
                     let resp = ui.add(egui::Label::new(galley.clone()).selectable(false).sense(Sense::click()));
+                    let can_click = audio_here || loaded_here || self.installed.contains(&self.cfg.engine);
                     // click a word to listen from there — also in chapters without audio yet
-                    if audio_here || loaded_here || self.installed.contains(&self.cfg.engine) {
+                    if can_click {
                         let resp = resp.clone().on_hover_cursor(egui::CursorIcon::PointingHand);
                         if resp.clicked() {
                             if let Some(pos) = resp.interact_pointer_pos() {
                                 let c = galley.cursor_from_pos(pos - resp.rect.min);
                                 click_char = Some(c.ccursor.index);
                             }
+                        }
+                    }
+                    // right-click a word to pin how it is spoken (pronunciation helper only);
+                    // the same char lookup the click uses finds the word under the pointer
+                    if helper_on {
+                        if resp.secondary_clicked() {
+                            if let Some(pos) = resp.interact_pointer_pos() {
+                                let c = galley.cursor_from_pos(pos - resp.rect.min).ccursor.index;
+                                self.pron_ask = word_at(&page, c).map(|w| config::peel_word(&w));
+                            }
+                        }
+                        if self.pron_ask.is_some() {
+                            let asked = self.pron_ask.clone();
+                            resp.context_menu(|ui| {
+                                if ui.button("Set pronunciation…").clicked() {
+                                    set_pron = Some(asked.unwrap());
+                                    ui.close_menu();
+                                }
+                            });
                         }
                     }
                     // keep the spoken word in view
@@ -796,6 +853,11 @@ impl App {
             1 => self.next_page(),
             -1 => self.prev_page(),
             _ => {}
+        }
+
+        if let Some(w) = set_pron {
+            self.pron_ask = None;
+            self.open_pron_win(&w);
         }
     }
 
@@ -1028,6 +1090,13 @@ impl App {
         }
         let mut open = true;
         let mut preview = false;
+        // picked up before the window body borrows cfg; a hand edit while Settings is open
+        // shows up through pron_sync's metadata check
+        self.pron_sync();
+        let pron_err = self.pron_err.clone();
+        let regen_offer = self.regen_offer.clone().filter(|o| !o.reader);
+        let pron_rows = self.pron.entries.clone();
+        let mut pron_acts: Vec<Act> = Vec::new();
         egui::Window::new(RichText::new("Settings").strong())
             .open(&mut open)
             .collapsible(false)
@@ -1197,6 +1266,84 @@ impl App {
                                 .small()
                                 .color(DIM),
                         );
+                        if cfg.normalize.enabled {
+                            if std::env::var_os("SHOTS").is_some() {
+                                ui.scroll_to_cursor(Some(Align::TOP)); // screenshots only: bring the list on screen
+                            }
+                            section(ui, "PRONUNCIATIONS");
+                            egui::ScrollArea::vertical().max_height(216.0).auto_shrink([false, false]).show(ui, |ui| {
+                                if pron_rows.is_empty() {
+                                    ui.label(RichText::new("No words yet. Add one below, or right-click a word while reading.").small().color(DIM));
+                                }
+                                for (i, (w, s)) in pron_rows.iter().enumerate() {
+                                    ui.horizontal(|ui| {
+                                        ui.style_mut().wrap_mode = Some(TextWrapMode::Truncate);
+                                        ui.label(RichText::new(w).strong()).on_hover_text(format!("{w} = {s}"));
+                                        // spoken form: committed on focus loss (Enter included), then saved at once
+                                        let id = egui::Id::new("pron-say").with(config::fold_word(w));
+                                        let mut t = ui.data_mut(|d| d.get_temp::<String>(id)).unwrap_or_else(|| s.clone());
+                                        let r = ui.add(egui::TextEdit::singleline(&mut t).hint_text("spoken form").desired_width(140.0));
+                                        if r.lost_focus() {
+                                            if t.trim() != *s {
+                                                pron_acts.push(Act::PronSet(i, t.clone()));
+                                            }
+                                            ui.data_mut(|d| d.remove_temp::<String>(id));
+                                        } else if r.changed() {
+                                            ui.data_mut(|d| d.insert_temp(id, t.clone()));
+                                        }
+                                        if !t.trim().is_empty() && icon(ui, "⏵", "Hear it").clicked() {
+                                            pron_acts.push(Act::HearForm(t.trim().to_string()));
+                                        }
+                                        if icon(ui, "✖", "Remove this word").clicked() {
+                                            pron_acts.push(Act::PronRemove(i));
+                                        }
+                                    });
+                                    if let Some((row, msg)) = &pron_err {
+                                        if *row == Some(i) {
+                                            ui.label(RichText::new(msg).small().color(DANGER));
+                                        }
+                                    }
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                let (wid, sid) = (egui::Id::new("pron-add-word"), egui::Id::new("pron-add-say"));
+                                let mut w = ui.data_mut(|d| d.get_temp::<String>(wid)).unwrap_or_default();
+                                let mut s = ui.data_mut(|d| d.get_temp::<String>(sid)).unwrap_or_default();
+                                let rw = ui.add(egui::TextEdit::singleline(&mut w).hint_text("word").desired_width(110.0));
+                                let rs = ui.add(egui::TextEdit::singleline(&mut s).hint_text("spoken form").desired_width(140.0));
+                                let enter_hit = |r: &egui::Response, ui: &egui::Ui| {
+                                    r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter))
+                                };
+                                if primary(ui, "Add").clicked() || enter_hit(&rw, ui) || enter_hit(&rs, ui) {
+                                    if !w.trim().is_empty() || !s.trim().is_empty() {
+                                        pron_acts.push(Act::PronAdd(w.clone(), s.clone()));
+                                    }
+                                } else {
+                                    // the drafts live in the ui until Add commits them, not per keystroke
+                                    ui.data_mut(|d| {
+                                        d.insert_temp(wid, w.clone());
+                                        d.insert_temp(sid, s.clone());
+                                    });
+                                }
+                            });
+                            if let Some((None, msg)) = &pron_err {
+                                ui.label(RichText::new(msg).small().color(DANGER));
+                            }
+                            ui.label(
+                                RichText::new("A listed word is always spoken the given way, plural and possessive included; it applies to audio generated afterwards. The file stays hand-editable.")
+                                    .small()
+                                    .color(DIM),
+                            );
+                            if let Some(o) = &regen_offer {
+                                let n = o.chapters.len();
+                                if ui.add(Button::new(RichText::new(regen_label(&o.word, n)).color(ACCENT)).frame(false))
+                                    .on_hover_text("Existing audio keeps the old pronunciation until it is regenerated")
+                                    .clicked()
+                                {
+                                    pron_acts.push(Act::PronRegen);
+                                }
+                            }
+                        }
                     });
 
                 section(ui, "READING");
@@ -1258,6 +1405,9 @@ impl App {
                 }
               });
             });
+        for a in pron_acts {
+            self.apply(Some(a));
+        }
         if preview {
             self.preview_voice();
         }
@@ -1265,6 +1415,89 @@ impl App {
             self.show_settings = false;
             self.apply_worker_settings();
             self.cfg.save();
+            if self.regen_offer.as_ref().is_some_and(|o| !o.reader) {
+                self.regen_offer = None; // the offer lives next to where the change was made
+            }
+        }
+    }
+
+    /// The reader's "Set pronunciation" window: the clicked word, its spoken form, hear it,
+    /// Save and Cancel; after Save, chapters that already have audio can be regenerated.
+    fn pron_window(&mut self, ctx: &egui::Context) {
+        let Some(mut win) = self.pron_win.clone() else { return };
+        let id = egui::Id::new("pron-win-say");
+        let mut hear = None;
+        let mut save = false;
+        let mut regen = false;
+        let mut close = false;
+        egui::Window::new("Set pronunciation")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .default_width(360.0)
+            .show(ctx, |ui| {
+                ui.label(RichText::new("Word").small().color(DIM));
+                ui.label(RichText::new(&win.word).strong().size(17.0));
+                ui.add_space(4.0);
+                // spoken form: committed on focus loss (Enter included); the buttons read
+                // the draft either way, so a click right after typing still sees it
+                let mut s = ui.data_mut(|d| d.get_temp::<String>(id)).unwrap_or_else(|| win.say.clone());
+                let r = ui.add(egui::TextEdit::singleline(&mut s).hint_text("spoken form").desired_width(220.0));
+                if r.lost_focus() {
+                    win.say = s.trim().to_string();
+                    ui.data_mut(|d| d.remove_temp::<String>(id));
+                } else if r.changed() {
+                    ui.data_mut(|d| d.insert_temp(id, s.clone()));
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if !s.trim().is_empty() && icon(ui, "⏵", "Hear it").clicked() {
+                        hear = Some(s.trim().to_string());
+                    }
+                    if primary(ui, "Save").clicked() {
+                        win.say = s.trim().to_string();
+                        save = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        close = true;
+                    }
+                });
+                if let Some(e) = &win.err {
+                    ui.label(RichText::new(e).small().color(DANGER));
+                } else if win.saved {
+                    if let Some(o) = self.regen_offer.as_ref().filter(|o| o.reader && !o.chapters.is_empty()) {
+                        if ui.add(Button::new(RichText::new(regen_label(&o.word, o.chapters.len())).color(ACCENT)).frame(false))
+                            .on_hover_text("Existing audio keeps the old pronunciation until it is regenerated")
+                            .clicked()
+                        {
+                            regen = true;
+                        }
+                    } else {
+                        ui.label(RichText::new("Saved. It applies to audio generated from now on.").small().color(DIM));
+                    }
+                } else {
+                    ui.label(RichText::new("Always spoken this way, plural and possessive included, ignoring case.").small().color(DIM));
+                }
+            });
+        if let Some(s) = hear {
+            self.hear_form(&s);
+        }
+        if save {
+            match self.pron_set(&win.word, &win.say, true) {
+                Ok(_) => win.saved = true,
+                Err(e) => {
+                    win.err = Some(e);
+                    win.saved = false;
+                }
+            }
+        }
+        if regen {
+            self.accept_regen_offer();
+        }
+        if close || regen {
+            self.close_pron_win();
+        } else {
+            self.pron_win = Some(win);
         }
     }
 
@@ -1592,6 +1825,35 @@ impl App {
 /// Byte index of the `n`-th char.
 fn byte_at(s: &str, n: usize) -> usize {
     s.char_indices().nth(n).map_or(s.len(), |(b, _)| b)
+}
+
+/// The whitespace-delimited word around char index `c`, if the pointer sits on one.
+fn word_at(s: &str, c: usize) -> Option<String> {
+    let cs: Vec<char> = s.chars().collect();
+    let c = if c < cs.len() && !cs[c].is_whitespace() {
+        c
+    } else if c > 0 && !cs[c - 1].is_whitespace() {
+        c - 1 // the cursor landed just past the clicked word
+    } else {
+        return None;
+    };
+    let (mut i, mut j) = (c, c + 1);
+    while i > 0 && !cs[i - 1].is_whitespace() {
+        i -= 1;
+    }
+    while j < cs.len() && !cs[j].is_whitespace() {
+        j += 1;
+    }
+    Some(cs[i..j].iter().collect())
+}
+
+/// "⟳  Regenerate 3 chapters that contain “word”" (one chapter … that contains).
+fn regen_label(word: &str, n: usize) -> String {
+    if n == 1 {
+        format!("⟳  Regenerate 1 chapter that contains “{word}”")
+    } else {
+        format!("⟳  Regenerate {n} chapters that contain “{word}”")
+    }
 }
 
 // =============================== install window pieces ===============================

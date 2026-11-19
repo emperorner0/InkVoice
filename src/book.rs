@@ -56,13 +56,21 @@ pub fn now_secs() -> u64 {
 }
 
 /// Where books, audio, voice engines and their models live
-/// (~/.local/share/inkvoice on Linux, %LOCALAPPDATA%\\inkvoice on Windows).
+/// (~/.local/share/inkvoice on Linux, %LOCALAPPDATA%\inkvoice on Windows). On Windows the
+/// Known Folder API ignores LOCALAPPDATA, so INKVOICE_DATA is the only redirect that works
+/// everywhere; the worker processes read the same variable (workers/common.py).
 pub fn data_dir() -> PathBuf {
-    dirs::data_local_dir().unwrap_or_else(|| PathBuf::from(".")).join("inkvoice")
+    std::env::var_os("INKVOICE_DATA").map_or_else(
+        || dirs::data_local_dir().unwrap_or_else(|| PathBuf::from(".")).join("inkvoice"),
+        PathBuf::from,
+    )
 }
 
 pub fn config_dir() -> PathBuf {
-    dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("inkvoice")
+    std::env::var_os("INKVOICE_CONFIG").map_or_else(
+        || dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("inkvoice"),
+        PathBuf::from,
+    )
 }
 
 /// Early versions were called BookReader: move their data and settings over once.

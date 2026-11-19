@@ -49,8 +49,10 @@ is configured, is asked about every word as before the rule layer existed. Nothi
 ## Your own pronunciations
 
 Some words are read differently from one occurrence to the next, typically names and loanwords
-with accented letters. To pin one down, create `<InkVoice data>/pronunciations.txt` with one
-`word = spoken form` entry per line:
+with accented letters. To pin one down, add it to the pronunciations table: right-click the
+word while reading and choose "Set pronunciation…", or use the Pronunciations list in Settings
+(inside "Pronunciation helper (experimental)", which has to be enabled). Both write
+`<InkVoice data>/pronunciations.txt`, one `word = spoken form` line per entry:
 
 ```
 # lines starting with # are comments
@@ -58,12 +60,14 @@ doppelgänger = doppelganger
 Nguyen = nwin
 ```
 
-A listed word is always spoken in the given form, before any other rule and without asking the
-model. Matching ignores case and also covers the plural and the possessive of the word. The
-spoken form may contain only letters, spaces, hyphens and apostrophes; other lines are skipped
-with a note on the worker's stderr. The file is read when the voice engine starts, so change a
-voice setting or restart the app after editing it, and regenerate the chapters that should
-pick it up.
+The file stays hand-editable, including while the app is running. A listed word is always
+spoken in the given form, before any other rule and without asking the model. Matching ignores
+case and also covers the plural and the possessive of the word. The spoken form may contain
+only letters, spaces, hyphens and apostrophes; anything else is rejected with a short note.
+A change applies to audio generated afterwards, without restarting the engine or clearing the
+generation queue. Chapters that already have audio keep the old reading until they are
+regenerated, and after a change the app offers to regenerate exactly the ones that contain
+the word.
 
 ## Turning it on
 

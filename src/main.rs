@@ -56,6 +56,9 @@ struct Feed {
 }
 
 pub const SPEEDS: &[f32] = &[0.75, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0];
+/// The text of a voice preview (own words, ~10 s spoken).
+const PREVIEW_TEXT: &str = "The lamps along the river had already been lit when she reached the bridge. \
+                            “You came back,” he said quietly. She smiled, and for a moment neither of them spoke.";
 
 /// How an engine install ended (shown in the install window until dismissed).
 pub enum InstallOutcome {
@@ -81,6 +84,26 @@ struct Status {
     text: String,
     error: bool,
     at: Instant,
+}
+
+/// The reader's "Set pronunciation" window for one word (opened by right-clicking it).
+#[derive(Clone)]
+struct PronWin {
+    word: String,
+    /// committed draft of the spoken form; the field commits on focus loss
+    say: String,
+    saved: bool,
+    err: Option<String>,
+}
+
+/// Chapters of the open book that contain a word whose pronunciation just changed and
+/// already have audio; regenerating them is offered once, next to the change.
+#[derive(Clone)]
+struct RegenOffer {
+    word: String,
+    chapters: Vec<usize>,
+    /// shown in the reader's Set pronunciation window rather than the Settings list
+    reader: bool,
 }
 
 pub struct App {
@@ -130,6 +153,17 @@ pub struct App {
     confirm_uninstall: Option<String>,
     /// when the listening position was last written to progress.json
     listen_saved: Instant,
+    /// the reader's "Set pronunciation" window (None = closed)
+    pron_win: Option<PronWin>,
+    /// word under the pointer when the reader's context menu opened
+    pron_ask: Option<String>,
+    /// chapters offered for regeneration after a pronunciation changed
+    regen_offer: Option<RegenOffer>,
+    /// a rejected entry: None = the add row, Some(row) = that list row
+    pron_err: Option<(Option<usize>, String)>,
+    /// the pronunciation table, kept in memory; re-read when the file's state changes
+    pron: config::Pronounce,
+    pron_state: Option<(std::time::SystemTime, u64)>,
 }
 
 impl App {
@@ -187,6 +221,12 @@ impl App {
             installed: installer::SPECS.iter().filter(|s| installer::is_installed(s.name)).map(|s| s.name.to_string()).collect(),
             confirm_uninstall: None,
             listen_saved: Instant::now(),
+            pron_win: None,
+            pron_ask: None,
+            regen_offer: None,
+            pron_err: None,
+            pron: config::Pronounce::load(),
+            pron_state: config::Pronounce::file_state(),
             cfg,
         };
         app.sel = app.lib.first().map(|b| b.id.clone());
@@ -698,11 +738,21 @@ impl App {
 
     /// Generate (once) and play a short sample of the selected voice.
     fn preview_voice(&mut self) {
-        if !self.engine_ready() {
+        self.speak_sample(&self.cfg.profile(), PREVIEW_TEXT, false);
+    }
+
+    /// Speak `text` with the current engine and voice and play it. The sample is written to
+    /// `<data>/previews/<stem>.wav` (the stem pins the profile and the text) and reused when it
+    /// already exists. With no installed engine, `quiet` does nothing instead of opening Settings.
+    fn speak_sample(&mut self, stem: &str, text: &str, quiet: bool) {
+        if !self.installed.contains(&self.cfg.engine) {
+            if !quiet {
+                self.engine_ready(); // says why and opens Settings
+            }
             return;
         }
         self.apply_worker_settings();
-        let path = data_dir().join("previews").join(format!("{}.wav", self.cfg.profile()));
+        let path = data_dir().join("previews").join(format!("{stem}.wav"));
         if path.exists() {
             if let Some(p) = &mut self.player {
                 let _ = p.play(&path, "Voice preview".into(), Unit { book: String::new(), ch: 0, pg: None });
@@ -710,11 +760,108 @@ impl App {
             return;
         }
         let _ = std::fs::create_dir_all(path.parent().unwrap());
-        let text = "The lamps along the river had already been lit when she reached the bridge. \
-                    “You came back,” he said quietly. She smiled, and for a moment neither of them spoke.";
         self.pending.insert(path.clone(), "voice preview".into());
         self.tts.submit(tts::Job { text: text.into(), out: path.clone(), stream: None }, true);
         self.preview = Some(path);
+    }
+
+    /// "Hear it" for one pronunciation entry: the stem pins the voice and a digest of the
+    /// words, so every spoken form is generated once per voice.
+    fn hear_form(&mut self, say: &str) {
+        self.speak_sample(&format!("{}-{}", self.cfg.profile(), say_hash(say)), say, true);
+    }
+
+    // ---------- pronunciations ----------
+
+    /// Add or update a pronunciation (the table file is saved at once; the worker picks it
+    /// up without restarting). On success, chapters that already have audio and contain the
+    /// word are collected for the regenerate offer. `reader` marks offers made in the
+    /// reader's Set pronunciation window.
+    fn pron_set(&mut self, word: &str, say: &str, reader: bool) -> Result<bool, String> {
+        self.pron_sync();
+        let (row, updated) = self.pron.set(word, say).map_err(|e| e.to_string())?;
+        if let Err(e) = self.pron.save() {
+            self.pron_reload(); // keep memory in step with what is on disk
+            return Err(format!("Could not save pronunciations: {e}"));
+        }
+        self.pron_state = config::Pronounce::file_state();
+        let word = self.pron.entries[row].0.clone();
+        self.pron_err = None;
+        self.regen_offer = Some(RegenOffer { chapters: self.chapters_with_word(&word), word, reader });
+        Ok(updated)
+    }
+
+    fn pron_remove(&mut self, row: usize) {
+        self.pron_sync();
+        if row < self.pron.entries.len() {
+            self.pron.remove(row);
+            if let Err(e) = self.pron.save() {
+                self.pron_reload();
+                self.notify_err(format!("Could not save pronunciations: {e}"));
+                return;
+            }
+            self.pron_state = config::Pronounce::file_state();
+        }
+        self.pron_err = None;
+    }
+
+    /// Re-read the table when the file changed since the last load (a hand edit, or another
+    /// window of the app); one metadata call, a full parse only on a change.
+    fn pron_sync(&mut self) {
+        let st = config::Pronounce::file_state();
+        if st != self.pron_state {
+            self.pron_reload();
+        }
+    }
+
+    fn pron_reload(&mut self) {
+        self.pron = config::Pronounce::load();
+        self.pron_state = config::Pronounce::file_state();
+    }
+
+    /// Chapters of the open book that contain `word` as a whole word (plural and possessive
+    /// included, ignoring case) and already have audio for the current voice.
+    fn chapters_with_word(&self, word: &str) -> Vec<usize> {
+        let Some(b) = self.open_book() else { return Vec::new() };
+        b.chapters
+            .iter()
+            .enumerate()
+            .filter(|&(i, c)| {
+                config::contains_word(&b.chapter_text(i), word)
+                    && (if self.cfg.page_mode {
+                        (0..c.pages.len()).any(|p| self.is_ready(&self.audio_path(b, i, Some(p))))
+                    } else {
+                        self.is_ready(&self.audio_path(b, i, None))
+                    })
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Open the reader's Set pronunciation window for a clicked word, prefilled with the
+    /// entry it has, if any.
+    fn open_pron_win(&mut self, word: &str) {
+        self.pron_sync();
+        let say = self.pron.find(word).map(|i| self.pron.entries[i].1.clone()).unwrap_or_default();
+        self.pron_win = Some(PronWin { word: word.to_string(), say, saved: false, err: None });
+    }
+
+    /// Regenerate the offered chapters and drop the offer.
+    fn accept_regen_offer(&mut self) {
+        if let Some(o) = self.regen_offer.take() {
+            for ch in o.chapters {
+                self.regenerate_chapter(ch);
+            }
+        }
+    }
+
+    /// Close the Set pronunciation window and drop a regenerate offer that belongs to it.
+    fn close_pron_win(&mut self) {
+        self.pron_win = None;
+        self.ctx.data_mut(|d| d.remove_temp::<String>(egui::Id::new("pron-win-say")));
+        if self.regen_offer.as_ref().is_some_and(|o| o.reader) {
+            self.regen_offer = None;
+        }
     }
 
     fn toggle_play(&mut self) {
@@ -1063,6 +1210,14 @@ fn book_id_of(p: &Path) -> Option<String> {
     Some(p.parent()?.parent()?.parent()?.file_name()?.to_string_lossy().into_owned())
 }
 
+/// Short digest of a spoken form, for "hear it" preview file names.
+fn say_hash(say: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    say.hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
 fn parse_unit_name(stem: &str) -> Option<(usize, Option<usize>)> {
     let rest = stem.strip_prefix('c')?;
     Some(match rest.split_once("_p") {
@@ -1174,25 +1329,78 @@ mod tests {
 }
 
 /// Renders the real UI to PNGs (no window). Run with:
-///   XDG_DATA_HOME=... XDG_CONFIG_HOME=... SHOTS=dir cargo test --release screenshots -- --ignored
+///   SHOTS=dir cargo test --release screenshots -- --ignored
+/// The app's data and config folders are redirected to <dir>/data and <dir>/config (Linux
+/// also honours XDG_DATA_HOME/XDG_CONFIG_HOME), and the run refuses to start unless the
+/// redirect took effect, so the real library is never read or written.
 #[cfg(test)]
 mod screenshots {
     use super::*;
     use egui_kittest::Harness;
 
+    /// Redirect the app to scratch folders inside the SHOTS dir and return false when the
+    /// redirect did not take (on Windows the Known Folder API ignores LOCALAPPDATA and
+    /// APPDATA, so only INKVOICE_DATA/INKVOICE_CONFIG actually work there).
+    fn scratch(dir: &str) -> bool {
+        let root = PathBuf::from(dir);
+        let (data, config) = (root.join("data"), root.join("config"));
+        let _ = std::fs::create_dir_all(&data);
+        let _ = std::fs::create_dir_all(&config);
+        std::env::set_var("INKVOICE_DATA", &data);
+        std::env::set_var("INKVOICE_CONFIG", &config);
+        let ok = book::data_dir().starts_with(&root) && book::config_dir().starts_with(&root);
+        if !ok {
+            eprintln!(
+                "screenshots: refusing to run, data is {} and config is {}",
+                book::data_dir().display(),
+                book::config_dir().display()
+            );
+        }
+        ok
+    }
+
+    /// A tiny original book (four sections of four short pages) inside the scratch data,
+    /// so no real library is ever read. Nguyen appears so the regenerate offer has a hit.
+    fn fixture_book() -> book::Book {
+        let line = |sec: usize, p: usize, n: usize| {
+            format!("Nguyen {sec} counted {n} lanterns on page {p}, and the tide answered none of it.")
+        };
+        book::Book {
+            id: "shots_book".into(),
+            title: "The Salt Road".into(),
+            author: String::new(),
+            source: String::new(),
+            chapters: (1..=4)
+                .map(|sec| book::Chapter {
+                    title: format!("Section {sec}"),
+                    pages: (1..=4)
+                        .map(|p| (0..6).map(|n| line(sec, p, n)).collect::<Vec<_>>().join(" "))
+                        .collect(),
+                })
+                .collect(),
+            pos: (0, 0),
+            opened: 0,
+            listen: None,
+        }
+    }
+
     #[test]
     #[ignore]
     fn screenshots() {
         let Ok(dir) = std::env::var("SHOTS") else { return };
+        if !scratch(&dir) {
+            return;
+        }
+        fixture_book().save().unwrap();
+        // audio of an earlier run would make every page "ready"; start from scratch
+        let _ = std::fs::remove_dir_all(book::books_dir().join("shots_book").join("audio"));
         let save = |h: &mut Harness<App>, name: &str| {
             h.run_steps(4);
             h.render().unwrap().save(format!("{dir}/{name}.png")).unwrap();
         };
         let mut h = Harness::builder().with_size([1280.0, 800.0]).build_eframe(|cc| App::new(cc, None));
-        // SHOT_BOOK picks a book by title, SHOT_CH a chapter with at least 4 pages
-        let want = std::env::var("SHOT_BOOK").unwrap_or_default().to_lowercase();
-        let id = h.state().lib.iter().find(|b| b.title.to_lowercase().contains(&want)).unwrap_or(&h.state().lib[0]).id.clone();
-        let shot_ch: usize = std::env::var("SHOT_CH").ok().and_then(|c| c.parse().ok()).unwrap_or(4);
+        let id = h.state().lib[0].id.clone();
+        let shot_ch: usize = std::env::var("SHOT_CH").ok().and_then(|c| c.parse().ok()).unwrap_or(1);
         h.state_mut().sel = Some(id.clone());
         save(&mut h, "1_library");
 
@@ -1217,6 +1425,13 @@ mod screenshots {
         let engine = h.state().cfg.engine.clone();
         h.state_mut().cfg.engine = "woof".into();
         h.state_mut().cfg.set_adv("temp", Some("0.650".into()));
+        // pronunciation helper on, with two example entries in the table
+        let s = h.state_mut();
+        s.cfg.normalize.enabled = true;
+        s.pron.set("doppelgänger", "doppel ganger").unwrap();
+        s.pron.set("Nguyen", "nwin").unwrap();
+        s.pron.save().unwrap();
+        s.pron_state = config::Pronounce::file_state();
         save(&mut h, "4_settings");
         h.state_mut().cfg.set_adv("temp", None);
         h.state_mut().cfg.engine = engine;
@@ -1228,9 +1443,17 @@ mod screenshots {
         s.job = None;
         s.cfg.speed = 1.25;
         let stream_pg = s.book(&id).map_or(3, |b| b.chapters[shot_ch].pages.len().saturating_sub(1).clamp(1, 3));
+        // a previous run of this test may have left the page's audio behind; drop it so
+        // this really streams
+        let stream_unit = Unit { book: id.clone(), ch: shot_ch, pg: Some(stream_pg) };
+        if let Some(p) = s.unit_path(&stream_unit) {
+            let _ = std::fs::remove_file(&p);
+            let _ = std::fs::remove_file(player::timing_path(&p));
+            s.have.remove(&p);
+        }
         s.go(shot_ch, stream_pg);
         let t0 = Instant::now();
-        s.play_unit(Unit { book: id.clone(), ch: shot_ch, pg: Some(stream_pg) }, None);
+        s.play_unit(stream_unit, None);
         let mut started = None;
         while t0.elapsed().as_secs() < 90 {
             h.run_steps(1);
@@ -1281,6 +1504,15 @@ mod screenshots {
         let s = h.state_mut();
         s.inst.result = Some(("kokoro".into(), InstallOutcome::Failed("curl: (6) Could not resolve host: github.com".into()), Instant::now()));
         save(&mut h, "8_install_failed");
+
+        // the reader's Set pronunciation window over the page, saved, offering regeneration
+        let s = h.state_mut();
+        s.inst.result = None;
+        s.show_settings = false;
+        s.cfg.normalize.enabled = true;
+        s.pron_set("Nguyen", "nwin", true).unwrap();
+        s.pron_win = Some(PronWin { word: "Nguyen".into(), say: "nwin".into(), saved: true, err: None });
+        save(&mut h, "9_set_pronunciation");
     }
 
     /// Asking to listen while another chapter is being generated must start right away
@@ -1288,10 +1520,14 @@ mod screenshots {
     #[test]
     #[ignore]
     fn listen_now_during_background_generation() {
+        let Ok(dir) = std::env::var("SHOTS") else { return };
+        if !scratch(&dir) {
+            return;
+        }
+        fixture_book().save().unwrap();
         let mut h = Harness::builder().with_size([1280.0, 800.0]).build_eframe(|cc| App::new(cc, None));
-        let want = std::env::var("SHOT_BOOK").unwrap_or_default().to_lowercase();
-        let id = h.state().lib.iter().find(|b| b.title.to_lowercase().contains(&want)).unwrap().id.clone();
-        let shot_ch: usize = std::env::var("SHOT_CH").ok().and_then(|c| c.parse().ok()).unwrap_or(4);
+        let id = h.state().lib[0].id.clone();
+        let shot_ch: usize = std::env::var("SHOT_CH").ok().and_then(|c| c.parse().ok()).unwrap_or(1);
         h.state_mut().open_reader(&id);
         h.state_mut().cfg.page_mode = true;
         if let Ok(e) = std::env::var("SHOT_ENGINE") {

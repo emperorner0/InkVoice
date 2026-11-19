@@ -1,7 +1,7 @@
 use crate::book::data_dir;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// English Phonon voices (from `python -m ptts --list-voices`).
 pub const PHONON_VOICES: &[&str] = &[
@@ -115,6 +115,177 @@ pub struct Normalize {
 impl Default for Normalize {
     fn default() -> Self {
         Normalize { enabled: false, url: String::new(), model: String::new(), key: String::new() }
+    }
+}
+
+
+// ---------------- pronunciation table ----------------
+
+/// The user's pronunciation table (`<data>/pronunciations.txt`): one `word = spoken form`
+/// per line, `#` starts a comment. workers/spoken_rules.py reads the same file with the same
+/// rules and applies entries before anything else, plural and possessive included.
+pub struct Pronounce {
+    /// leading comment lines of the file, kept verbatim across saves
+    header: Vec<String>,
+    /// (word, spoken form) in table order
+    pub entries: Vec<(String, String)>,
+}
+
+/// A typed word without decorative punctuation, the way the worker's `_core` sees it
+/// (workers/spoken_rules.py): anything not alphanumeric peeled off both ends, except the
+/// currency/caliber marks that lead a spoken thing and the unit marks that trail one.
+pub fn peel_word(word: &str) -> String {
+    let s: Vec<char> = word.trim().chars().collect();
+    let mut i = 0;
+    let mut j = s.len();
+    while i < j && !s[i].is_alphanumeric() && !"$£€.-".contains(s[i]) {
+        i += 1;
+    }
+    while j > i && !s[j - 1].is_alphanumeric() && !"%°".contains(s[j - 1]) {
+        j -= 1;
+    }
+    s[i..j].iter().collect()
+}
+
+/// Matching form of a word: lowercase, typographic apostrophe as a plain one
+/// (workers/spoken_rules.py `_fold`).
+pub fn fold_word(word: &str) -> String {
+    word.chars().flat_map(char::to_lowercase).map(|c| if c == '’' { '\'' } else { c }).collect()
+}
+
+/// Whether a spoken form is usable: ASCII letters, spaces, hyphens and apostrophes only,
+/// starting and ending with a letter (the worker's `_SAY_OK`).
+pub fn spoken_ok(say: &str) -> bool {
+    let c: Vec<char> = say.chars().collect();
+    let ok = |c: char| c.is_ascii_alphabetic() || matches!(c, ' ' | '-' | '\'');
+    c.first().is_some_and(|c| c.is_ascii_alphabetic())
+        && c.last().is_some_and(|c| c.is_ascii_alphabetic())
+        && c.iter().all(|&c| ok(c))
+}
+
+/// Whether `text` contains `word` as a whole word, its plural ("s") and possessive ("'s")
+/// included, the way the worker's table lookup matches a token.
+pub fn contains_word(text: &str, word: &str) -> bool {
+    let key = fold_word(word);
+    if key.is_empty() {
+        return false;
+    }
+    text.split_whitespace().any(|tok| {
+        let f = fold_word(&peel_word(tok));
+        f == key || f == format!("{key}s") || f == format!("{key}'s")
+    })
+}
+
+impl Pronounce {
+    pub fn path() -> PathBuf {
+        data_dir().join("pronunciations.txt")
+    }
+
+    /// (modification time, size) of the table file, or None while it does not exist. The app
+    /// keeps the parsed table in memory and re-reads it only when this changes.
+    pub fn file_state() -> Option<(std::time::SystemTime, u64)> {
+        let m = std::fs::metadata(Self::path()).ok()?;
+        Some((m.modified().ok()?, m.len()))
+    }
+    pub fn load() -> Self {
+        Self::read(&Self::path())
+    }
+
+    /// The table at `path`; a missing file is an empty table, bad lines are skipped, a
+    /// repeated word (case-insensitively) keeps its first spot with the last spoken form.
+    pub fn read(path: &Path) -> Self {
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+        let mut p = Pronounce { header: Vec::new(), entries: Vec::new() };
+        for line in text.lines() {
+            let body = line.split('#').next().unwrap_or("").trim();
+            if body.is_empty() {
+                if p.entries.is_empty() {
+                    p.header.push(line.to_string()); // blanks before the first entry
+                }
+                continue;
+            }
+            let Some((w, s)) = body.split_once('=') else { continue };
+            let (w, s) = (w.trim(), s.trim());
+            if w.is_empty() || w.chars().any(char::is_whitespace) || !spoken_ok(s) {
+                continue;
+            }
+            let key = fold_word(w);
+            match p.entries.iter_mut().find(|(ew, _)| fold_word(ew) == key) {
+                Some(e) => e.1 = s.to_string(),
+                None => p.entries.push((w.to_string(), s.to_string())),
+            }
+        }
+        while p.header.last().is_some_and(|l| l.trim().is_empty()) {
+            p.header.pop();
+        }
+        p
+    }
+
+    pub fn save(&self) -> std::io::Result<()> {
+        self.write(&Self::path())
+    }
+
+    /// Header comments, then one `word = spoken form` line per entry; written to a temporary
+    /// file first and renamed into place.
+    pub fn write(&self, path: &Path) -> std::io::Result<()> {
+        let mut out = String::new();
+        for l in &self.header {
+            out.push_str(l);
+            out.push('\n');
+        }
+        for (w, s) in &self.entries {
+            out.push_str(&format!("{w} = {s}\n"));
+        }
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        let tmp = PathBuf::from(tmp);
+        if let Some(d) = path.parent() {
+            std::fs::create_dir_all(d)?;
+        }
+        std::fs::write(&tmp, out)?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    /// Row of the entry for `word` (case-insensitive, apostrophes folded).
+    pub fn find(&self, word: &str) -> Option<usize> {
+        let key = fold_word(word);
+        self.entries.iter().position(|(w, _)| fold_word(w) == key)
+    }
+
+    /// Add an entry, or update the existing row when the word is already listed (ignoring
+    /// case). The word is peeled first; `Err` carries a short reason for the field it came
+    /// from. Returns the row and whether an existing entry was updated.
+    pub fn set(&mut self, word: &str, say: &str) -> Result<(usize, bool), &'static str> {
+        let w = peel_word(word);
+        let s = say.trim();
+        if w.is_empty() {
+            return Err("Type a word first");
+        }
+        if w.chars().any(char::is_whitespace) {
+            return Err("One word only, no spaces inside it");
+        }
+        if w.contains('=') || w.contains('#') {
+            return Err("Words cannot contain = or #");
+        }
+        if s.is_empty() {
+            return Err("Type how it should be spoken");
+        }
+        if !spoken_ok(s) {
+            return Err("Spoken form: letters, spaces, hyphens and apostrophes only");
+        }
+        if let Some(i) = self.find(&w) {
+            self.entries[i].1 = s.to_string();
+            Ok((i, true))
+        } else {
+            self.entries.push((w, s.to_string()));
+            Ok((self.entries.len() - 1, false))
+        }
+    }
+
+    pub fn remove(&mut self, row: usize) {
+        self.entries.remove(row);
     }
 }
 
@@ -379,5 +550,77 @@ mod tests {
         assert!(!old.normalize.enabled);
         assert!(old.normalize.url.is_empty());
         assert!(old.normalize.model.is_empty() && old.normalize.key.is_empty());
+    }
+
+    /// Round trip through a file: leading comments survive, entries come back in order.
+    #[test]
+    fn pronunciations_round_trip() {
+        let dir = std::env::temp_dir().join(format!("inkvoice-pron-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("pronunciations.txt");
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, "# my words\n\n# more\nlorem = lo rem\n").unwrap();
+        let mut t = Pronounce::read(&path);
+        assert_eq!(t.entries, vec![("lorem".into(), "lo rem".into())]);
+        t.set("Nguyen", "nwin").unwrap();
+        t.write(&path).unwrap(); // never save() in a unit test: it writes the app data folder
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "# my words\n\n# more\nlorem = lo rem\nNguyen = nwin\n"
+        );
+        let back = Pronounce::read(&path);
+        assert_eq!(back.entries, t.entries);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn pronunciations_parse_like_the_worker() {
+        let dir = std::env::temp_dir().join(format!("inkvoice-pron-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("parse.txt");
+        std::fs::write(&path, "\u{feff}doppelgänger = doppelganger\nbad line\nx = 1two3\nmulti word = nope\nDopp = ok\n# comment after\n").unwrap();
+        let t = Pronounce::read(&path);
+        assert_eq!(t.entries.len(), 2);
+        assert_eq!(t.entries[0], ("doppelgänger".into(), "doppelganger".into()));
+        assert_eq!(t.entries[1], ("Dopp".into(), "ok".into()));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn pronunciations_validate() {
+        let mut t = Pronounce { header: Vec::new(), entries: Vec::new() };
+        assert_eq!(t.set("Nguyen", "nwin").unwrap().1, false);
+        assert_eq!(t.set("nguyen", "noo win").unwrap().1, true, "same word ignoring case updates");
+        assert_eq!(t.entries.len(), 1);
+        assert_eq!(t.entries[0].1, "noo win");
+        assert_eq!(t.set("rock’n’roll", "rok and rol").unwrap().1, false);
+        assert_eq!(t.set("rock'n'roll", "rok and rol").unwrap().1, true, "typographic and plain apostrophes are one key");
+        for (w, s) in [("", "nwin"), ("(", "nwin"), ("two words", "nwin"), ("a=b", "nwin"), ("Nguyen", ""), ("Nguyen", "n win!"), ("Nguyen", "4nwin"), ("Nguyen", "4")] {  // say is trimmed first, so " point four five " would be fine
+            assert!(t.set(w, s).is_err(), "({w:?}, {s:?}) should be rejected");
+        }
+        assert!(t.set(".45s", "point four five s").is_ok(), "a caliber word is fine");
+        assert!(t.set("NGUYEN’S", "nwin").is_ok(), "the possessive is its own entry, as in the worker");
+    }
+
+    #[test]
+    fn pronunciations_peel() {
+        assert_eq!(peel_word("(Nguyen’s)"), "Nguyen’s");
+        assert_eq!(peel_word(" “word,” "), "word");
+        assert_eq!(peel_word("’twas—"), "twas");
+        assert_eq!(peel_word(".45s"), ".45s");
+        assert_eq!(peel_word("350°"), "350°");
+        assert_eq!(peel_word("..."), "");
+    }
+
+    #[test]
+    fn pronunciations_whole_word_match() {
+        let text = "Nguyen smiled at the Nguyens’ neighbour. The nguyen's dog barked. Nguyenfield stayed quiet.";
+        assert!(contains_word(text, "nguyen"), "plain, ignoring case");
+        assert!(contains_word("the Nguyens next door", "Nguyen"), "plural");
+        assert!(contains_word("The nguyen's dog barked", "Nguyen"), "possessive");
+        assert!(contains_word("the Nguyens’ dog", "Nguyen"), "plural possessive once the decoration is peeled");
+        assert!(!contains_word("Nguyenfield stayed quiet", "Nguyen"), "no match inside a longer word");
+        assert!(!contains_word("the harbor at noon", "har"));
+        assert!(contains_word("she said, “Nguyen?”", "Nguyen"));
     }
 }
