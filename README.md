@@ -50,9 +50,10 @@ This repository is a fork of [sabeel111/InkVoice](https://github.com/sabeel111/I
   from punctuation and pauses.
 - Exact resume: the app remembers the word last heard for each book, and Play continues from that word after a
   pause or an app restart.
-- Pronunciation helper (experimental, off by default): a language model behind any OpenAI-compatible server
-  supplies the spoken form of numbers, abbreviations and words like a past-tense "read" before the voice
-  reads them. It works with every engine. See [docs/normalization.md](docs/normalization.md).
+- Pronunciation helper (experimental, off by default): built-in rules read numbers, money, times and
+  common abbreviations aloud correctly, with no server needed; an optional language model behind any
+  OpenAI-compatible server settles ambiguous words like a past-tense "read". It works with every
+  engine. See [docs/normalization.md](docs/normalization.md).
 
 ## Install
 

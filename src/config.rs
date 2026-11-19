@@ -101,7 +101,8 @@ pub const QWEN3_PARAMS: &[Param] = &[
     },
 ];
 
-/// Optional LLM pass: rewrites words a voice misreads into their spoken form (workers/normalizer.py).
+/// Spoken-form pass: built-in rules always, plus an optional LLM for what rules cannot settle
+/// (workers/normalizer.py, workers/spoken_rules.py).
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(default)]
 pub struct Normalize {
@@ -113,7 +114,7 @@ pub struct Normalize {
 
 impl Default for Normalize {
     fn default() -> Self {
-        Normalize { enabled: false, url: "http://127.0.0.1:8091/v1".into(), model: String::new(), key: String::new() }
+        Normalize { enabled: false, url: String::new(), model: String::new(), key: String::new() }
     }
 }
 
@@ -287,18 +288,22 @@ impl Config {
                 }
             }
         }
-        if self.normalize.enabled && !self.normalize.url.is_empty() {
-            cmd.extend(["--normalize-url".into(), self.normalize.url.clone()]);
-            if !self.normalize.model.is_empty() {
-                cmd.extend(["--normalize-model".into(), self.normalize.model.clone()]);
+        if self.normalize.enabled {
+            cmd.push("--normalize-rules".into());
+            if !self.normalize.url.is_empty() {
+                cmd.extend(["--normalize-url".into(), self.normalize.url.clone()]);
+                if !self.normalize.model.is_empty() {
+                    cmd.extend(["--normalize-model".into(), self.normalize.model.clone()]);
+                }
             }
         }
         cmd
     }
 
-    /// Worker env `INKVOICE_NORMALIZE_KEY`, set when normalization is on and a key is configured.
+    /// Worker env `INKVOICE_NORMALIZE_KEY`, set when normalization is on with a server and a key is configured.
     pub fn normalize_key(&self) -> Option<String> {
-        (self.normalize.enabled && !self.normalize.key.is_empty()).then(|| self.normalize.key.clone())
+        (self.normalize.enabled && !self.normalize.url.is_empty() && !self.normalize.key.is_empty())
+            .then(|| self.normalize.key.clone())
     }
 }
 
@@ -355,17 +360,24 @@ mod tests {
         let mut c = Config::default();
         assert!(!c.worker_command().iter().any(|a| a.starts_with("--normalize")), "off by default");
         c.normalize.enabled = true;
+        c.normalize.key = "sk-1".into();
+        // rules alone when no server is configured
+        let cmd = c.worker_command();
+        assert!(cmd.iter().any(|a| a == "--normalize-rules"));
+        assert!(!cmd.iter().any(|a| a == "--normalize-url" || a == "--normalize-model"), "no url, no server flags");
+        assert!(c.normalize_key().is_none(), "key held back without a url");
+        // with a server, model is passed and the key applies
         c.normalize.url = "http://127.0.0.1:8091/v1".into();
         c.normalize.model = "smol".into();
         let cmd = c.worker_command();
+        assert!(cmd.iter().any(|a| a == "--normalize-rules"));
         assert!(cmd.windows(2).any(|w| w[0] == "--normalize-url" && w[1] == "http://127.0.0.1:8091/v1"));
         assert!(cmd.windows(2).any(|w| w[0] == "--normalize-model" && w[1] == "smol"));
-        c.normalize.url.clear();
-        assert!(!c.worker_command().iter().any(|a| a.starts_with("--normalize")), "no url, no flags");
+        assert_eq!(c.normalize_key().as_deref(), Some("sk-1"));
         // configs saved before the group existed still load with the defaults
         let old: Config = serde_json::from_value(serde_json::json!({"engine": "kokoro", "sentence_pause": 0.4})).unwrap();
         assert!(!old.normalize.enabled);
-        assert_eq!(old.normalize.url, "http://127.0.0.1:8091/v1");
+        assert!(old.normalize.url.is_empty());
         assert!(old.normalize.model.is_empty() && old.normalize.key.is_empty());
     }
 }

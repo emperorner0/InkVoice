@@ -17,10 +17,12 @@ Word timing is estimated, not model-reported: inside each synthesized piece, pun
 matched to the pauses actually detected in the audio, and words are interpolated between
 those anchors by character length.
 
-Normalization: with --normalize-url set, normalizer.py asks an OpenAI-compatible LLM for one
-spoken token per original word of each piece (numbers, abbreviations and ambiguous words respelled).
-The spoken tokens are synthesized while every offset stays that of the original text; any failure
-falls back to the original words.
+Normalization: with --normalize-rules and/or --normalize-url set, each piece goes through
+spoken_rules.py (deterministic spoken forms for money, clock times, ordinals, titles and
+friends, via inflect) and, when a URL is configured, normalizer.py asks an OpenAI-compatible
+LLM about only the words the rules could not settle (ambiguous numbers, abbreviations and
+heteronyms). The spoken tokens are synthesized while every offset stays that of the original
+text; any failure falls back to the words the rules produced (or the original text).
 """
 import argparse, json, os, re, sys, wave
 import numpy as np
@@ -48,6 +50,8 @@ def base_args(default_voice):
     ap.add_argument("--para-pause", type=float, default=0.60, help="gap between paragraphs (s)")
     ap.add_argument("--max-pause", type=float, default=0.45, help="shorten internal silences longer than this (s)")
     ap.add_argument("--max-chars", type=int, default=700, help="split paragraphs longer than this at sentence ends")
+    ap.add_argument("--normalize-rules", action="store_true",
+                    help="deterministic spoken-form rules without an LLM")
     ap.add_argument("--normalize-url", default="", help="OpenAI-compatible /v1 endpoint that respells words (empty = off)")
     ap.add_argument("--normalize-model", default="", help="model name at the normalize endpoint")
     return ap
@@ -296,11 +300,12 @@ def serve(args, load):
     per request. The optional align_fn(piece_words, audio, sr, t0) replaces the estimated word
     timings with measured ones (see aligner.py)."""
     normalize_fn = None
-    if args.normalize_url:  # optional LLM pass; the key never goes on the command line
+    if args.normalize_url or getattr(args, "normalize_rules", False):
+        # rules alone when no URL is given; the LLM only sees what the rules cannot settle
         from normalizer import make
         normalize_fn = make(args.normalize_url, args.normalize_model,
-                            key=os.environ.get("INKVOICE_NORMALIZE_KEY"),
-                            cache_dir=os.path.join(data_dir(), "normalize-cache"))
+                            key=os.environ.get("INKVOICE_NORMALIZE_KEY") if args.normalize_url else None,
+                            cache_dir=os.path.join(data_dir(), "normalize-cache") if args.normalize_url else None)
     align_fn = None
     try:
         loaded = load()

@@ -1160,9 +1160,9 @@ impl App {
                         dirty |= ui.checkbox(&mut cfg.normalize.enabled, "Enabled").changed();
                         egui::Grid::new("normalize").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
                             for (label, value, hint, secret) in [
-                                ("Server", &mut cfg.normalize.url, "http://127.0.0.1:8091/v1", false),
-                                ("Model", &mut cfg.normalize.model, "model name", false),
-                                ("Key", &mut cfg.normalize.key, "optional", true),
+                                ("Server (optional)", &mut cfg.normalize.url, "http://127.0.0.1:8091/v1", false),
+                                ("Model (optional)", &mut cfg.normalize.model, "model name", false),
+                                ("Key (optional)", &mut cfg.normalize.key, "optional", true),
                             ] {
                                 ui.label(label);
                                 let id = ui.id().with(("normalize", label));
@@ -1183,11 +1183,20 @@ impl App {
                             }
                         });
                         ui.label(
-                            RichText::new("A language model rewrites numbers, abbreviations and words like \"read\" into their spoken form before the voice reads them. It needs an OpenAI-compatible server, local or hosted.")
+                            RichText::new("Built-in rules read numbers, money, times and common abbreviations aloud correctly; no server needed.")
                                 .small()
                                 .color(DIM),
                         );
-                        ui.label(RichText::new("Already generated chapters keep their audio until they are regenerated. The key is only needed for hosted servers.").small().color(DIM));
+                        ui.label(
+                            RichText::new("With a server address filled in, a language model (any OpenAI-compatible server, local or hosted) settles ambiguous cases such as calibers and \"read\".")
+                                .small()
+                                .color(DIM),
+                        );
+                        ui.label(
+                            RichText::new("The key is only needed for hosted servers. Already generated chapters keep their audio until they are regenerated.")
+                                .small()
+                                .color(DIM),
+                        );
                     });
 
                 section(ui, "READING");
