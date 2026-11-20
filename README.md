@@ -53,7 +53,8 @@ This repository is a fork of [sabeel111/InkVoice](https://github.com/sabeel111/I
 - Pronunciation helper (experimental, off by default): built-in rules read numbers, money, times and
   common abbreviations aloud correctly, with no server needed; an optional language model behind any
   OpenAI-compatible server settles ambiguous words like a past-tense "read". It works with every
-  engine. See [docs/normalization.md](docs/normalization.md).
+  engine. A table in Settings pins the spoken form of single words, and right-clicking a word in the reader
+  adds it. See [docs/normalization.md](docs/normalization.md).
 - Sections recognised as front or back matter (title pages, contents, praise, "also by", about-the-author,
   notes and the like) are left out of listening, generating and the chapter numbering, each one overridable
   from its context menu in the contents list. See [docs/sections-and-files.md](docs/sections-and-files.md).
@@ -61,7 +62,7 @@ This repository is a fork of [sabeel111/InkVoice](https://github.com/sabeel111/I
   (`03_The_Quiet_Harbor_c0003.wav`), moved over once at start-up; audio lookups go by the chapter key, so
   old names and title changes never orphan a file.
 - Audio manager in the book details panel: every generated file per voice with its size, duration and
-  date, delete and regenerate per section, delete all for a voice or the whole book, a clean-up for
+  age, delete and regenerate per section, delete all for a voice or the whole book, a clean-up for
   leftover files, and a button that opens a voice's folder in the file manager. Deleted files go to the
   Recycle Bin, where they can be restored. See [docs/managing-audio.md](docs/managing-audio.md).
 
