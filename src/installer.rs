@@ -15,6 +15,12 @@ use std::time::{Duration, Instant};
 const UV_VERSION: &str = "0.13.7";
 const PYTHON: &str = "3.12";
 
+/// Folder in the Hugging Face cache that holds the word-timing model Qwen3 fetches at warm-up.
+const WORD_TIMING_MODEL: &str = "models--facebook--wav2vec2-base-960h";
+
+/// Prefix of the model folders Phonon's warm-up fetches into the Hugging Face cache.
+const PHONON_MODELS: &str = "models--gradium--";
+
 pub struct Spec {
     pub name: &'static str,
     pub title: &'static str,
@@ -137,12 +143,14 @@ pub fn venv_python() -> PathBuf {
 
 /// The Python of one of InkVoice's environments (`venv` is a folder inside the data folder).
 pub fn python_in(venv: &str) -> PathBuf {
-    let v = data_dir().join(venv);
+    python_in_venv(&data_dir().join(venv))
+}
+
+fn python_in_venv(v: &Path) -> PathBuf {
     if cfg!(windows) { v.join("Scripts").join("python.exe") } else { v.join("bin").join("python") }
 }
 
-fn site_packages(venv: &str) -> Vec<PathBuf> {
-    let v = data_dir().join(venv);
+fn site_packages_in(v: &Path) -> Vec<PathBuf> {
     let mut out = vec![v.join("Lib").join("site-packages")];
     if let Ok(rd) = std::fs::read_dir(v.join("lib")) {
         out.extend(rd.flatten().map(|e| e.path().join("site-packages")));
@@ -151,40 +159,56 @@ fn site_packages(venv: &str) -> Vec<PathBuf> {
 }
 
 pub fn is_installed(name: &str) -> bool {
+    installed_in(name, &data_dir())
+}
+
+/// [`is_installed`] against a given data folder, so removal can be tested on a temporary tree.
+fn installed_in(name: &str, d: &Path) -> bool {
     let Some(s) = spec(name) else { return false };
     // engines that fetch weights at warm-up keep them in <data>/hf
-    if s.warmup.is_some() && !data_dir().join(s.probe_dir.unwrap_or("hf")).is_dir() {
+    if s.warmup.is_some() && !d.join(s.probe_dir.unwrap_or("hf")).is_dir() {
         return false;
     }
-    python_in(s.venv).exists()
-        && site_packages(s.venv).iter().any(|sp| sp.join(s.probe_pkg).is_dir())
-        && s.files.iter().all(|(_, rel)| data_dir().join(rel).is_file())
+    let venv = d.join(s.venv);
+    python_in_venv(&venv).exists()
+        && site_packages_in(&venv).iter().any(|sp| sp.join(s.probe_pkg).is_dir())
+        && s.files.iter().all(|(_, rel)| d.join(rel).is_file())
 }
 
 /// Remove an engine's model files (the shared Python environment stays; it is small).
 pub fn remove(name: &str) {
-    let d = data_dir();
+    remove_in(name, &data_dir());
+    if name == "phonon" {
+        if let Some(py) = venv_python().to_str() {
+            let _ = uv_cmd(&["pip", "uninstall", "--python", py, "ptts"]).output();
+        }
+    }
+}
+
+/// The folder half of [`remove`] on a given data folder, so it can be tested on a temporary
+/// tree. In the Hugging Face cache `<data>/hf/hub` Qwen3 owns its `models--Qwen--*` folders
+/// and the word-timing model, Phonon the `models--gradium--*` folders; everything else there
+/// belongs to someone else and stays.
+fn remove_in(name: &str, d: &Path) {
     match name {
         "qwen3" => {
             let _ = std::fs::remove_dir_all(d.join("venv-qwen3"));
             for e in std::fs::read_dir(d.join("hf").join("hub")).into_iter().flatten().flatten() {
-                if e.file_name().to_string_lossy().starts_with("models--Qwen--") {
+                let n = e.file_name().into_string().unwrap_or_default();
+                if n.starts_with("models--Qwen--") || n == WORD_TIMING_MODEL {
                     let _ = std::fs::remove_dir_all(e.path());
                 }
             }
         }
         "phonon" => {
-            // everything fetched from Hugging Face except other engines' models
+            // only the folders Phonon's warm-up fetched; the cache may hold other things
             for e in std::fs::read_dir(d.join("hf").join("hub")).into_iter().flatten().flatten() {
-                if !e.file_name().to_string_lossy().starts_with("models--Qwen--") {
+                if e.file_name().to_string_lossy().starts_with(PHONON_MODELS) {
                     let _ = std::fs::remove_dir_all(e.path());
                 }
             }
-            if !is_installed("qwen3") {
+            if !installed_in("qwen3", d) && hub_only_housekeeping(&d.join("hf").join("hub")) {
                 let _ = std::fs::remove_dir_all(d.join("hf"));
-            }
-            if let Some(py) = venv_python().to_str() {
-                let _ = uv_cmd(&["pip", "uninstall", "--python", py, "ptts"]).output();
             }
         }
         "kokoro" => {
@@ -195,6 +219,12 @@ pub fn remove(name: &str) {
         }
         _ => {}
     }
+}
+
+/// Whether the Hugging Face cache hub still holds anything but its own bookkeeping (`.locks`, …).
+fn hub_only_housekeeping(hub: &Path) -> bool {
+    std::fs::read_dir(hub).into_iter().flatten().flatten()
+        .all(|e| e.file_name().to_string_lossy().starts_with('.'))
 }
 
 #[derive(Clone)]
@@ -701,6 +731,79 @@ mod tests {
     fn parses_uv_sizes() {
         assert!((super::parse_size("16.0MiB") - 16.777).abs() < 0.01);
         assert!((super::parse_size("512KiB") - 0.524).abs() < 0.01);
+    }
+
+    /// Lay out the folders `installed_in` probes for, without installing anything.
+    fn fake_install(d: &std::path::Path, name: &str) {
+        let s = super::spec(name).unwrap();
+        std::fs::create_dir_all(d.join(s.probe_dir.unwrap_or("hf"))).unwrap();
+        let py = super::python_in_venv(&d.join(s.venv));
+        std::fs::create_dir_all(py.parent().unwrap()).unwrap();
+        std::fs::write(py, b"").unwrap();
+        std::fs::create_dir_all(d.join(s.venv).join("Lib").join("site-packages").join(s.probe_pkg)).unwrap();
+        for (_, rel) in s.files {
+            std::fs::create_dir_all(d.join(rel).parent().unwrap()).unwrap();
+            std::fs::write(d.join(rel), b"").unwrap();
+        }
+    }
+
+    #[test]
+    fn phonon_removal_keeps_what_it_does_not_own() {
+        let d = std::env::temp_dir().join(format!("inkvoice-remove-phonon-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let hub = d.join("hf").join("hub");
+        for f in ["models--gradium--phonon-31m-en", "models--gradium--phonon-voices",
+                  "models--Qwen--Qwen3-TTS-12Hz-0.6B-Base", super::WORD_TIMING_MODEL,
+                  "models--other--thing", ".locks"] {
+            std::fs::create_dir_all(hub.join(f)).unwrap();
+        }
+        fake_install(&d, "qwen3");
+        super::remove_in("phonon", &d);
+        assert!(!hub.join("models--gradium--phonon-31m-en").exists());
+        assert!(!hub.join("models--gradium--phonon-voices").exists());
+        assert!(hub.join("models--Qwen--Qwen3-TTS-12Hz-0.6B-Base").is_dir());
+        assert!(hub.join(super::WORD_TIMING_MODEL).is_dir());
+        assert!(hub.join("models--other--thing").is_dir());
+        assert!(hub.join(".locks").is_dir());
+        assert!(d.join("hf").is_dir(), "Qwen3 still needs the cache");
+        assert!(d.join("venv-qwen3").is_dir(), "Qwen3's Python environment stays");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn phonon_removal_without_qwen3_removes_the_whole_cache() {
+        let d = std::env::temp_dir().join(format!("inkvoice-remove-phonon-alone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let hub = d.join("hf").join("hub");
+        std::fs::create_dir_all(hub.join("models--gradium--phonon-31m-en")).unwrap();
+        std::fs::create_dir_all(hub.join(".locks")).unwrap();
+        super::remove_in("phonon", &d);
+        assert!(!d.join("hf").exists(), "only bookkeeping was left");
+        std::fs::create_dir_all(hub.join("models--gradium--phonon-voices")).unwrap();
+        std::fs::create_dir_all(hub.join("models--other--thing")).unwrap();
+        super::remove_in("phonon", &d);
+        assert!(hub.join("models--other--thing").is_dir(), "a foreign folder keeps the cache");
+        assert!(d.join("hf").is_dir());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn qwen3_removal_removes_its_models_and_python() {
+        let d = std::env::temp_dir().join(format!("inkvoice-remove-qwen3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let hub = d.join("hf").join("hub");
+        std::fs::create_dir_all(hub.join("models--Qwen--Qwen3-TTS-12Hz-0.6B-Base")).unwrap();
+        std::fs::create_dir_all(hub.join(super::WORD_TIMING_MODEL)).unwrap();
+        std::fs::create_dir_all(hub.join("models--gradium--phonon-31m-en")).unwrap();
+        fake_install(&d, "qwen3");
+        fake_install(&d, "phonon");
+        super::remove_in("qwen3", &d);
+        assert!(!d.join("venv-qwen3").exists());
+        assert!(!hub.join("models--Qwen--Qwen3-TTS-12Hz-0.6B-Base").exists());
+        assert!(!hub.join(super::WORD_TIMING_MODEL).exists());
+        assert!(hub.join("models--gradium--phonon-31m-en").is_dir());
+        assert!(super::installed_in("phonon", &d), "Phonon keeps working");
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// Full install into an empty data folder, printing the progress the UI would show. Run with:
