@@ -3,7 +3,7 @@
 use crate::player::Word;
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex};
 
@@ -128,6 +128,20 @@ impl Tts {
             }
         }
         q.jobs.push_front(job);
+        cv.notify_one();
+    }
+
+    /// Drop one job: taken off the queue while it still waits; when it is the job running,
+    pub fn cancel_one(&self, out: &Path) {
+        let (lock, cv) = &*self.queue;
+        let mut q = lock.lock().unwrap();
+        q.jobs.retain(|j| j.out != out);
+        if q.running.as_ref().is_some_and(|r| r.out == out) {
+            q.preempted = true;
+            if let Some(c) = self.child.lock().unwrap().as_mut() {
+                let _ = c.kill();
+            }
+        }
         cv.notify_one();
     }
 
@@ -287,5 +301,36 @@ for line in sys.stdin:
         let bg_restart = log.iter().rposition(|l| l == "started background").unwrap();
         assert!(listen_done < bg_restart, "background job resumes after the requested one");
         assert!(background_done, "background job was finished after all");
+    }
+
+    /// Cancelling one job takes only that job: a queued one vanishes without an event, the
+    /// running one stops (reported as Interrupted) and the next job starts right after.
+    #[test]
+    fn cancel_one_skips_only_that_job() {
+        let tts = Tts::start(vec!["python3".into(), "-c".into(), FAKE.into()], None, eframe::egui::Context::default());
+        let next = |timeout: f32| tts.rx.recv_timeout(Duration::from_secs_f32(timeout)).ok();
+
+        tts.submit(job("one", None), false);
+        tts.submit(job("two", None), false);
+        tts.submit(job("three", None), false);
+        assert!(matches!(next(5.0), Some(Event::Started(p)) if p == PathBuf::from("one")));
+        std::thread::sleep(Duration::from_millis(300)); // "two" and "three" wait, "one" runs
+        tts.cancel_one(&PathBuf::from("two")); // still queued: dropped, no event
+        tts.cancel_one(&PathBuf::from("one")); // running: stopped, reported as interrupted
+        let mut log = Vec::new();
+        while let Some(ev) = next(15.0) {
+            let tag = match &ev {
+                Event::Started(p) => format!("started {}", p.display()),
+                Event::Done { out, .. } => format!("done {}", out.display()),
+                Event::Interrupted(p) => format!("interrupted {}", p.display()),
+                Event::Failed(p, e) => panic!("{} failed: {e}", p.display()),
+                _ => continue,
+            };
+            log.push(tag.clone());
+            if tag == "done three" {
+                break;
+            }
+        }
+        assert_eq!(log, vec!["interrupted one", "started three", "done three"]);
     }
 }

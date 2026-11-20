@@ -105,6 +105,44 @@ fn ago(secs: u64) -> String {
     }
 }
 
+/// "1.4 MB", and GB above 1024 MB.
+fn fmt_size(bytes: u64) -> String {
+    let mb = bytes as f64 / (1024.0 * 1024.0);
+    if mb >= 1024.0 { format!("{:.1} GB", mb / 1024.0) } else { format!("{mb:.1} MB") }
+}
+
+/// When an audio file was made: "made today", "made 3 days ago".
+fn made(when: u64) -> String {
+    if when == 0 {
+        return String::new();
+    }
+    let d = crate::book::now_secs().saturating_sub(when) / 86400;
+    match d {
+        0 => "made today".into(),
+        1 => "made yesterday".into(),
+        2..=30 => format!("made {d} days ago"),
+        _ if d / 30 == 1 => "made 1 month ago".into(),
+        _ => format!("made {} months ago", d / 30),
+    }
+}
+
+/// The inline "delete all audio?" confirmation, in the style of the remove-book one: what
+/// would go, how much it is, then Delete or Cancel. The counts were gathered when the
+/// confirmation was opened, so this draws without touching the disk.
+fn confirm_box(ui: &mut egui::Ui, act: &mut Option<Act>, c: &crate::ConfirmDel, question: &str) {
+    ui.label(RichText::new(question).color(DANGER));
+    let plural = if c.files == 1 { "" } else { "s" };
+    ui.label(RichText::new(format!("{} file{plural} · {}. They go to the Recycle Bin.", c.files, fmt_size(c.bytes))).small().color(DIM));
+    ui.horizontal(|ui| {
+        if ui.add(Button::new(RichText::new("Delete").color(ON_ACCENT)).fill(DANGER)).clicked() {
+            *act = Some(Act::DelAll(c.id.clone(), c.scope.clone()));
+        }
+        if ui.button("Cancel").clicked() {
+            *act = Some(Act::CancelDelAll);
+        }
+    });
+}
+
 /// Things clicked inside a panel, applied after drawing (keeps borrows simple).
 enum Act {
     Open(String),
@@ -120,8 +158,20 @@ enum Act {
     /// set this section's own skip-when-listening choice
     SetSkip(usize, bool),
     GenerateAll,
-    Regenerate(usize),
-    /// speak this spoken form once ("hear it")
+    /// regenerate a chapter of a book with the current voice settings
+    Regenerate(String, usize),
+    /// delete one audio file (with its timing file)
+    DelAudioFile(std::path::PathBuf),
+    /// delete a section's audio for the current voice
+    DelSectionAudio(String, usize),
+    /// ask / confirm / do a bulk audio deletion: one voice, or the whole book
+    AskDelAll(String, crate::DelAll),
+    CancelDelAll,
+    DelAll(String, crate::DelAll),
+    /// remove a book's leftover files
+    CleanJunk(String),
+    /// show one audio folder in the system file manager
+    OpenAudioFolder(std::path::PathBuf),
     HearForm(String),
     /// commit a new spoken form for table row `row`
     PronSet(usize, String),
@@ -157,8 +207,17 @@ impl App {
                     }
                 }
             }
-            Some(Act::Regenerate(ch)) => self.regenerate_chapter(ch),
-            Some(Act::HearForm(say)) => self.hear_form(&say),
+            Some(Act::Regenerate(id, ch)) => self.regenerate_chapter(&id, ch),
+            Some(Act::DelAudioFile(p)) => self.delete_audio_file(&p),
+            Some(Act::DelSectionAudio(id, ch)) => self.delete_section_audio(&id, ch),
+            Some(Act::AskDelAll(id, scope)) => self.ask_del_all(&id, scope),
+            Some(Act::CancelDelAll) => self.confirm_del_audio = None,
+            Some(Act::DelAll(id, scope)) => match scope {
+                crate::DelAll::Voice(profile) => self.delete_voice_audio(&id, &profile),
+                crate::DelAll::Book => self.delete_book_audio(&id),
+            },
+            Some(Act::CleanJunk(id)) => self.clean_leftovers(&id),
+            Some(Act::OpenAudioFolder(p)) => crate::open_folder(&p),
             Some(Act::PronSet(row, say)) => {
                 // the word comes from the saved row, so a hand edit between frames cannot
                 // redirect the change onto another entry
@@ -169,6 +228,7 @@ impl App {
                     None => {}
                 }
             }
+            Some(Act::HearForm(say)) => self.hear_form(&say),
             Some(Act::PronRemove(row)) => self.pron_remove(row),
             Some(Act::PronAdd(word, say)) => {
                 self.pron_err = None;
@@ -546,15 +606,16 @@ impl App {
                         act = Some(Act::Open(id.clone()));
                     }
 
-                    // ---- audio ----
-                    let items: Vec<(String, std::path::PathBuf, Unit, String, f32)> = self
-                        .lib_audio
-                        .get(&id)
-                        .map(|v| v.iter().map(|a| (a.profile.clone(), a.path.clone(), a.unit.clone(), a.label.clone(), a.duration)).collect())
-                        .unwrap_or_default();
-                    let total: f32 = items.iter().map(|i| i.4).sum();
-                    section(ui, &format!("AUDIO  ·  {} files · {}", items.len(), fmt_time(total)));
-                    if items.is_empty() {
+                    // ---- audio manager ----
+                    let items = self.lib_audio.get(&id).cloned().unwrap_or_default();
+                    let junk = self.lib_junk.get(&id).cloned().unwrap_or_default();
+                    let skipped: Vec<bool> =
+                        self.book(&id).map(|b| b.chapters.iter().map(|c| c.skipped()).collect()).unwrap_or_default();
+                    let audio_root = self.book(&id).map(|b| b.dir().join("audio"));
+                    let (total, bytes): (f32, u64) = items.iter().fold((0.0, 0), |(t, s), i| (t + i.duration, s + i.size));
+                    let junk_bytes: u64 = junk.iter().map(|j| j.size).sum();
+                    section(ui, &format!("AUDIO  ·  {} files · {} · {}", items.len(), fmt_time(total), fmt_size(bytes)));
+                    if items.is_empty() && junk.is_empty() {
                         ui.label(RichText::new("No audio yet. Open the book and press ⏵ to listen.").color(DIM));
                     }
                     let (now_path, playing) = self
@@ -562,30 +623,102 @@ impl App {
                         .as_ref()
                         .map(|p| (p.now.as_ref().map(|n| n.path.clone()), p.is_playing()))
                         .unwrap_or((None, false));
+                    let voice = self.cfg.profile();
+                    let confirming = self.confirm_del_audio.clone();
                     let mut last_profile = String::new();
-                    for (profile, path, unit, label, dur) in items {
-                        if profile != last_profile {
-                            ui.add_space(4.0);
-                            ui.label(RichText::new(config::profile_label(&profile)).small().color(ACCENT));
-                            last_profile = profile;
-                        }
-                        ui.horizontal(|ui| {
-                            let is_now = now_path.as_ref() == Some(&path);
-                            let glyph = if is_now && playing { "⏸" } else { "⏵" };
-                            let color = if is_now { ACCENT } else { TEXT };
-                            if ui.add(Button::new(RichText::new(glyph).color(color)).min_size(Vec2::new(28.0, 24.0))).clicked() {
-                                act = Some(if is_now { Act::Toggle } else { Act::PlayPath(path.clone(), unit.clone()) });
-                            }
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                ui.label(RichText::new(fmt_time(dur)).small().color(DIM));
-                                ui.style_mut().wrap_mode = Some(TextWrapMode::Truncate);
-                                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                                    ui.label(RichText::new(&label).color(color));
+                    for it in &items {
+                        if it.profile != last_profile {
+                            last_profile = it.profile.clone();
+                            ui.add_space(6.0);
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(config::profile_label(&it.profile)).small().color(ACCENT));
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if icon(ui, "🗑", "Delete all audio of this voice…").clicked() {
+                                        act = Some(Act::AskDelAll(id.clone(), crate::DelAll::Voice(it.profile.clone())));
+                                    }
+                                    if icon(ui, "📂", "Open this voice's folder in the file manager").clicked() {
+                                        let dir = audio_root.as_ref().map(|r| r.join(&it.profile)).unwrap_or_default();
+                                        act = Some(Act::OpenAudioFolder(dir));
+                                    }
                                 });
+                            });
+                            let g: Vec<_> = items.iter().filter(|i| i.profile == it.profile).collect();
+                            let mut secs = 0;
+                            let mut prev_ch = None;
+                            for i in &g {
+                                if Some(i.unit.ch) != prev_ch {
+                                    secs += 1;
+                                    prev_ch = Some(i.unit.ch);
+                                }
+                            }
+                            let (gdur, gbytes): (f32, u64) = g.iter().fold((0.0, 0), |(t, s), i| (t + i.duration, s + i.size));
+                            let plural = if secs == 1 { "" } else { "s" };
+                            ui.label(RichText::new(format!("{secs} section{plural} · {} · {}", fmt_time(gdur), fmt_size(gbytes))).small().color(DIM));
+                            let scope = crate::DelAll::Voice(it.profile.clone());
+                            if let Some(c) = confirming.as_ref().filter(|c| c.id == id && c.scope == scope) {
+                                let q = format!("Delete all audio of {}?", config::profile_label(&it.profile));
+                                confirm_box(ui, &mut act, c, &q);
+                            }
+                        }
+                        // one row: play, title, then regenerate and delete for this file
+                        ui.horizontal(|ui| {
+                            let is_now = now_path.as_ref() == Some(&it.path);
+                            let glyph = if is_now && playing { "⏸" } else { "⏵" };
+                            let dim = skipped.get(it.unit.ch).copied().unwrap_or(false);
+                            let color = if is_now { ACCENT } else if dim { DIM } else { TEXT };
+                            if ui.add(Button::new(RichText::new(glyph).color(if is_now { ACCENT } else { TEXT })).min_size(Vec2::new(28.0, 24.0))).clicked() {
+                                act = Some(if is_now { Act::Toggle } else { Act::PlayPath(it.path.clone(), it.unit.clone()) });
+                            }
+                            ui.vertical(|ui| {
+                                ui.horizontal(|ui| {
+                                    ui.style_mut().wrap_mode = Some(TextWrapMode::Truncate);
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        if icon(ui, "🗑", "Delete this file (to the Recycle Bin)").clicked() {
+                                            act = Some(Act::DelAudioFile(it.path.clone()));
+                                        }
+                                        if it.profile == voice && icon(ui, "⟳", "Make this section's audio again with the current settings").clicked() {
+                                            act = Some(Act::Regenerate(id.clone(), it.unit.ch));
+                                        }
+                                        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                                            ui.label(RichText::new(&it.label).color(color));
+                                        });
+                                    });
+                                });
+                                let when = made(it.modified);
+                                let meta = if when.is_empty() {
+                                    format!("{} · {}", fmt_time(it.duration), fmt_size(it.size))
+                                } else {
+                                    format!("{} · {} · {}", fmt_time(it.duration), fmt_size(it.size), when)
+                                };
+                                ui.label(RichText::new(meta).small().color(DIM));
                             });
                         });
                     }
 
+                    // leftovers and the book-wide deletion
+                    if !junk.is_empty() {
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(format!("Leftovers: {} files · {}", junk.len(), fmt_size(junk_bytes))).small().color(DIM))
+                                .on_hover_text("Files no generation needs any more: interrupted streams, part-written files, estimated timings, timing files without their audio, and audio of sections the book no longer has");
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui.button("Clean up").on_hover_text("Move the leftover files to the Recycle Bin").clicked() {
+                                    act = Some(Act::CleanJunk(id.clone()));
+                                }
+                            });
+                        });
+                    }
+                    if !items.is_empty() {
+                        ui.add_space(4.0);
+                        if let Some(c) = confirming.as_ref().filter(|c| c.id == id && c.scope == crate::DelAll::Book) {
+                            confirm_box(ui, &mut act, c, "Delete all audio of this book?");
+                        } else if ui.add(Button::new(RichText::new("🗑  Delete all audio").color(DIM)).frame(false))
+                            .on_hover_text("Every voice's audio and timing files; the book itself stays")
+                            .clicked()
+                        {
+                            act = Some(Act::AskDelAll(id.clone(), crate::DelAll::Book));
+                        }
+                    }
                     ui.add_space(24.0);
                     ui.separator();
                     if self.confirm_remove.as_deref() == Some(id.as_str()) {
@@ -690,13 +823,24 @@ impl App {
                                 if r.clicked() {
                                     act = Some(Act::GoChapter(i));
                                 }
+                                let has_audio = self.book(&book_id).is_some_and(|b| {
+                                    if page_mode {
+                                        (0..*pages).any(|p| self.is_ready(&self.audio_path(b, i, Some(p))))
+                                    } else {
+                                        self.is_ready(&self.audio_path(b, i, None))
+                                    }
+                                });
                                 r.context_menu(|ui| {
                                     if ui.button(if *skipped { "Include when listening" } else { "Skip when listening" }).clicked() {
                                         act = Some(Act::SetSkip(i, !*skipped));
                                         ui.close_menu();
                                     }
                                     if ui.button("⟳  Regenerate audio").on_hover_text("Delete this chapter's audio for the current voice and make it again with the current settings").clicked() {
-                                        act = Some(Act::Regenerate(i));
+                                        act = Some(Act::Regenerate(book_id.clone(), i));
+                                        ui.close_menu();
+                                    }
+                                    if has_audio && ui.button("🗑  Delete audio").on_hover_text("Move this section's audio files for the current voice to the Recycle Bin").clicked() {
+                                        act = Some(Act::DelSectionAudio(book_id.clone(), i));
                                         ui.close_menu();
                                     }
                                 });

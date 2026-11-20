@@ -35,12 +35,47 @@ enum View {
 }
 
 /// A generated audio file on disk, for the library's audio list.
+#[derive(Clone)]
 struct AudioItem {
     profile: String,
     path: PathBuf,
     unit: Unit,
     label: String,
     duration: f32,
+    /// bytes on disk (the wav alone)
+    size: u64,
+    /// unix seconds of the file's modification time
+    modified: u64,
+}
+
+/// A leftover file under a book's audio folder, offered for clean-up.
+#[derive(Clone)]
+struct JunkFile {
+    path: PathBuf,
+    size: u64,
+}
+
+/// How audio files are deleted: to the system trash in the app, plain removal in tests.
+trait Remover {
+    fn remove(&mut self, path: &Path) -> Result<(), String>;
+    /// A group in one operation when the platform offers it; by default one by one.
+    fn remove_all(&mut self, paths: &[PathBuf]) -> Result<(), String> {
+        for p in paths {
+            self.remove(p)?;
+        }
+        Ok(())
+    }
+}
+
+/// The app's remover: every file goes to the Recycle Bin, where it can be restored.
+struct RecycleBin;
+impl Remover for RecycleBin {
+    fn remove(&mut self, path: &Path) -> Result<(), String> {
+        trash::delete(path).map_err(|e| e.to_string())
+    }
+    fn remove_all(&mut self, paths: &[PathBuf]) -> Result<(), String> {
+        trash::delete_all(paths.to_vec()).map_err(|e| e.to_string())
+    }
 }
 
 struct Job {
@@ -131,10 +166,14 @@ pub struct App {
     /// their unit keys, so a unit is found whatever name form its file is in
     have_keys: HashMap<(usize, Option<usize>), PathBuf>,
     lib_audio: HashMap<String, Vec<AudioItem>>,
+    /// leftover files per book, for the audio manager's clean-up offer
+    lib_junk: HashMap<String, Vec<JunkFile>>,
     status: Option<Status>,
     ctx: egui::Context,
     scroll_top: bool,
     confirm_remove: Option<String>,
+    /// a pending "delete all audio" confirmation (counts gathered when it was opened)
+    confirm_del_audio: Option<ConfirmDel>,
     covers: HashMap<String, Option<egui::TextureHandle>>,
     search: String,
     show_settings: bool,
@@ -167,6 +206,23 @@ pub struct App {
     /// the pronunciation table, kept in memory; re-read when the file's state changes
     pron: config::Pronounce,
     pron_state: Option<(std::time::SystemTime, u64)>,
+}
+
+/// A "delete all audio" confirmation target: one voice folder, or every voice of a book.
+#[derive(Clone, PartialEq)]
+enum DelAll {
+    Voice(String),
+    Book,
+}
+
+/// A pending "delete all audio" confirmation: what would go, counted once when it was
+/// asked for, so drawing it never touches the disk.
+#[derive(Clone)]
+struct ConfirmDel {
+    id: String,
+    scope: DelAll,
+    files: usize,
+    bytes: u64,
 }
 
 impl App {
@@ -205,6 +261,8 @@ impl App {
             worker_dirty: false,
             follow_target: None,
             seek_drag: None,
+            lib_junk: HashMap::new(),
+            confirm_del_audio: None,
             sidebar: true,
             last_word: None,
             preview: None,
@@ -337,8 +395,14 @@ impl App {
     }
 
     fn refresh_lib_audio(&mut self) {
-        let map = self.lib.iter().map(|b| (b.id.clone(), scan_audio(b))).collect();
-        self.lib_audio = map;
+        let busy: HashSet<PathBuf> = self.pending.keys().cloned().collect();
+        let (mut audio, mut junk) = (HashMap::new(), HashMap::new());
+        for b in &self.lib {
+            audio.insert(b.id.clone(), scan_audio(b));
+            junk.insert(b.id.clone(), scan_leftovers(b, &busy));
+        }
+        self.lib_audio = audio;
+        self.lib_junk = junk;
     }
 
     fn open_reader(&mut self, id: &str) {
@@ -393,6 +457,7 @@ impl App {
         }
         let _ = std::fs::remove_dir_all(b.dir());
         self.lib_audio.remove(&b.id);
+        self.lib_junk.remove(&b.id);
         self.covers.remove(&b.id);
         if self.open.as_deref() == Some(id) {
             self.open = None;
@@ -400,6 +465,127 @@ impl App {
         self.sel = self.lib.first().map(|b| b.id.clone());
         self.confirm_remove = None;
         self.notify(format!("Removed “{}”", b.title));
+    }
+
+    // ---------- audio management ----------
+
+    /// Re-read the open book's ready files and one book's library entries after audio files
+    /// changed on disk.
+    fn refresh_audio_after(&mut self, id: &str) {
+        self.refresh_have();
+        if let Some(b) = self.book(id) {
+            let busy: HashSet<PathBuf> = self.pending.keys().cloned().collect();
+            let (a, j) = (scan_audio(b), scan_leftovers(b, &busy));
+            self.lib_audio.insert(id.to_string(), a);
+            self.lib_junk.insert(id.to_string(), j);
+        }
+    }
+
+    /// Send `paths` (each wav with its timing file) to the Recycle Bin. Playback of those
+    /// files stops and their queued or running generations are cancelled first, so deleted
+    /// audio cannot reappear; a file that cannot be moved is left where it is.
+    fn trash_audio(&mut self, id: &str, paths: &[PathBuf]) -> Deleted {
+        let Some(audio_dir) = self.book(id).map(|b| b.dir().join("audio")) else {
+            return Deleted { moved: 0, failed: Some((PathBuf::new(), "book not found".into())) };
+        };
+        for p in paths {
+            halt_unit_audio(&mut self.player, &mut self.feed, &mut self.pending, &mut self.job, p, &self.tts);
+        }
+        delete_audio_files(paths, &audio_dir, &mut RecycleBin)
+    }
+
+    /// Delete one audio file and its timing file (a row of the details panel's audio list).
+    fn delete_audio_file(&mut self, path: &Path) {
+        let Some(id) = book_id_of(path) else { return };
+        let r = self.trash_audio(&id, &[path.to_path_buf()]);
+        self.report_delete(&id, r, "Moved to the Recycle Bin");
+    }
+
+    /// Delete one section's audio for the current voice (the reader's "Delete audio"), in
+    /// whatever name form its files are in.
+    fn delete_section_audio(&mut self, id: &str, ch: usize) {
+        let Some(b) = self.book(id) else { return };
+        let dir = b.dir().join("audio").join(self.cfg.profile());
+        let pages = b.chapters.get(ch).map_or(0, |c| c.pages.len());
+        let units: Vec<Option<usize>> = if self.cfg.page_mode { (0..pages).map(Some).collect() } else { vec![None] };
+        let title = b.chapters.get(ch).map(|c| c.title.clone()).unwrap_or_default();
+        let files: Vec<PathBuf> = units.iter().flat_map(|pg| unit_files(&dir, ch, *pg)).collect();
+        let r = self.trash_audio(id, &files);
+        self.report_delete(id, r, &format!("Deleted the audio of {title}"));
+    }
+
+    /// Open the "delete all audio" confirmation, counting once what it covers.
+    fn ask_del_all(&mut self, id: &str, scope: DelAll) {
+        let Some(b) = self.book(id) else { return };
+        let dir = match &scope {
+            DelAll::Voice(p) => b.dir().join("audio").join(p),
+            DelAll::Book => b.dir().join("audio"),
+        };
+        let files = folder_files(&dir);
+        let bytes = files.iter().filter_map(|f| std::fs::metadata(f).ok()).map(|m| m.len()).sum();
+        self.confirm_del_audio = Some(ConfirmDel { id: id.to_string(), scope, files: files.len(), bytes });
+    }
+
+    /// Delete every audio and timing file of one voice in this book (after confirmation).
+    /// Generations still writing in the folder are stopped first, their temp files included.
+    fn delete_voice_audio(&mut self, id: &str, profile: &str) {
+        self.confirm_del_audio = None;
+        let Some(b) = self.book(id) else { return };
+        let dir = b.dir().join("audio").join(profile);
+        let audio = b.dir().join("audio");
+        let r = clear_audio_dir(&dir, &audio, &mut self.player, &mut self.feed, &mut self.pending, &mut self.job, &self.tts, &mut RecycleBin);
+        let _ = std::fs::remove_dir(&dir); // empty now
+        self.report_delete(id, r, &format!("Deleted all {} audio", config::profile_label(profile)));
+    }
+
+    /// Delete every voice's audio in this book (after confirmation). The book itself, its
+    /// text, cover and reading place stay.
+    fn delete_book_audio(&mut self, id: &str) {
+        self.confirm_del_audio = None;
+        let Some(b) = self.book(id) else { return };
+        let root = b.dir().join("audio");
+        let r = clear_audio_dir(&root, &root, &mut self.player, &mut self.feed, &mut self.pending, &mut self.job, &self.tts, &mut RecycleBin);
+        if let Ok(rd) = std::fs::read_dir(&root) {
+            for d in rd.flatten().map(|e| e.path()).filter(|p| p.is_dir()) {
+                let _ = std::fs::remove_dir(d); // empty voice folders
+            }
+        }
+        let _ = std::fs::remove_dir(&root);
+        self.report_delete(id, r, "Deleted all audio of this book");
+    }
+
+    /// Delete exactly the leftover files of a book (see `scan_leftovers`).
+    fn clean_leftovers(&mut self, id: &str) {
+        let Some(b) = self.book(id) else { return };
+        let busy: HashSet<PathBuf> = self.pending.keys().cloned().collect();
+        let junk = scan_leftovers(b, &busy);
+        if junk.is_empty() {
+            self.notify("No leftover files");
+            return;
+        }
+        let paths: Vec<PathBuf> = junk.into_iter().map(|j| j.path).collect();
+        let r = self.trash_audio(id, &paths);
+        self.report_delete(id, r, "Cleaned up the leftover files");
+    }
+
+    /// Tell the user how a deletion went: what moved, and the first file that could not.
+    fn report_delete(&mut self, id: &str, r: Deleted, done: &str) {
+        match r.failed {
+            None => self.notify(format!(
+                "{done}: {} {} to the Recycle Bin",
+                r.moved,
+                if r.moved == 1 { "file moved" } else { "files moved" }
+            )),
+            Some((p, e)) => {
+                let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                self.notify_err(format!(
+                    "{done}: {} {} to the Recycle Bin, {name} could not be moved ({e})",
+                    r.moved,
+                    if r.moved == 1 { "file moved" } else { "files moved" }
+                ));
+            }
+        }
+        self.refresh_audio_after(id);
     }
 
     fn import_dialog(&mut self) {
@@ -509,17 +695,16 @@ impl App {
     }
 
     /// Throw away a chapter's audio (current voice) and generate it again with the current settings.
-    fn regenerate_chapter(&mut self, ch: usize) {
+    fn regenerate_chapter(&mut self, id: &str, ch: usize) {
         if !self.engine_ready() {
             return;
         }
-        let Some(b) = self.open_book() else { return };
-        let id = b.id.clone();
-        let pages = b.chapters[ch].pages.len();
+        let Some(b) = self.book(id) else { return };
+        let pages = b.chapters.get(ch).map_or(0, |c| c.pages.len());
         let units: Vec<Unit> = if self.cfg.page_mode {
-            (0..pages).map(|p| Unit { book: id.clone(), ch, pg: Some(p) }).collect()
+            (0..pages).map(|p| Unit { book: id.to_string(), ch, pg: Some(p) }).collect()
         } else {
-            vec![Unit { book: id.clone(), ch, pg: None }]
+            vec![Unit { book: id.to_string(), ch, pg: None }]
         };
         for u in &units {
             let Some(path) = self.unit_path(u) else { continue };
@@ -541,12 +726,8 @@ impl App {
             }
             self.enqueue(u);
         }
-        self.refresh_have();
-        let title = self.unit_label(&Unit { book: id.clone(), ch, pg: None });
-        if let Some(b) = self.book(&id) {
-            let items = scan_audio(b);
-            self.lib_audio.insert(id, items);
-        }
+        self.refresh_audio_after(id);
+        let title = self.unit_label(&Unit { book: id.to_string(), ch, pg: None });
         self.notify(format!("Regenerating {title} with the current settings"));
     }
 
@@ -861,9 +1042,10 @@ impl App {
 
     /// Regenerate the offered chapters and drop the offer.
     fn accept_regen_offer(&mut self) {
-        if let Some(o) = self.regen_offer.take() {
+        let (offer, open) = (self.regen_offer.take(), self.open.clone());
+        if let (Some(o), Some(id)) = (offer, open) {
             for ch in o.chapters {
-                self.regenerate_chapter(ch);
+                self.regenerate_chapter(&id, ch);
             }
         }
     }
@@ -1100,10 +1282,12 @@ impl App {
                 }
             }
         }
+        let busy: HashSet<PathBuf> = self.pending.keys().cloned().collect();
         for id in changed_books {
             if let Some(b) = self.book(&id) {
-                let items = scan_audio(b);
-                self.lib_audio.insert(id, items);
+                let (a, j) = (scan_audio(b), scan_leftovers(b, &busy));
+                self.lib_audio.insert(id.clone(), a);
+                self.lib_junk.insert(id, j);
             }
         }
 
@@ -1299,17 +1483,121 @@ fn unit_stem(b: &Book, ch: usize, pg: Option<usize>) -> String {
     }
 }
 
-/// Delete every audio (and timing) file for one unit key in a voice folder, any name form.
-fn remove_unit_files(dir: &Path, ch: usize, pg: Option<usize>) {
+/// Every audio and timing file of one unit key in a voice folder, any name form.
+fn unit_files(dir: &Path, ch: usize, pg: Option<usize>) -> Vec<PathBuf> {
+    let mut out = Vec::new();
     if let Ok(rd) = std::fs::read_dir(dir) {
         for p in rd.flatten().map(|e| e.path()) {
             let same = p.file_stem().and_then(|s| s.to_str()).and_then(parse_unit_name) == Some((ch, pg));
             if same && p.extension().is_some_and(|e| e == "wav") {
-                let _ = std::fs::remove_file(&p);
-                let _ = std::fs::remove_file(player::timing_path(&p));
+                out.push(p.clone());
+                out.push(player::timing_path(&p));
             }
         }
     }
+    out
+}
+
+/// Delete every audio (and timing) file for one unit key in a voice folder, any name form.
+fn remove_unit_files(dir: &Path, ch: usize, pg: Option<usize>) {
+    for p in unit_files(dir, ch, pg) {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+/// Every file in `dir` and its subfolders (the voice folders of a book's audio).
+fn folder_files(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(dir) else { return out };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            out.extend(folder_files(&p));
+        } else {
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// Stop and forget everything the app keeps for one wav: playback of it, its stream feed,
+/// and its queued or running generation. The worker reports a cancelled running job as
+/// Interrupted, which the event handler ignores, so this must clear the state itself.
+fn halt_unit_audio(
+    player: &mut Option<Player>,
+    feed: &mut Option<Feed>,
+    pending: &mut HashMap<PathBuf, String>,
+    job: &mut Option<Job>,
+    wav: &Path,
+    tts: &tts::Tts,
+) {
+    if player.as_ref().and_then(|p| p.now.as_ref()).is_some_and(|n| n.path == wav) {
+        if let Some(p) = player.as_mut() {
+            p.stop();
+        }
+    }
+    if feed.as_ref().is_some_and(|f| f.out == wav) {
+        *feed = None;
+    }
+    if pending.remove(wav).is_some() {
+        tts.cancel_one(wav);
+        if job.as_ref().is_some_and(|j| j.path == wav) {
+            *job = None;
+        }
+    }
+}
+
+/// Halt everything under a folder: playback of any file in it, its stream feed, and every
+/// queued or running generation whose wav lies in it (so a running stream's temp file is
+/// never taken away while it is still being written).
+fn halt_audio_under(
+    player: &mut Option<Player>,
+    feed: &mut Option<Feed>,
+    pending: &mut HashMap<PathBuf, String>,
+    job: &mut Option<Job>,
+    tts: &tts::Tts,
+    dir: &Path,
+) {
+    if player.as_ref().and_then(|p| p.now.as_ref()).is_some_and(|n| n.path.starts_with(dir)) {
+        if let Some(p) = player.as_mut() {
+            p.stop();
+        }
+    }
+    if feed.as_ref().is_some_and(|f| f.out.starts_with(dir)) {
+        *feed = None;
+    }
+    let jobs: Vec<PathBuf> = pending.keys().filter(|p| p.starts_with(dir)).cloned().collect();
+    for p in jobs {
+        pending.remove(&p);
+        tts.cancel_one(&p);
+        if job.as_ref().is_some_and(|j| j.path == p) {
+            *job = None;
+        }
+    }
+}
+
+/// The core of "delete all audio in this folder" (one voice, or a book's whole audio
+/// folder): halt everything alive under `dir`, then send the folder's files to the trash.
+/// `dir` and everything in it must sit under `audio_dir`.
+fn clear_audio_dir(
+    dir: &Path,
+    audio_dir: &Path,
+    player: &mut Option<Player>,
+    feed: &mut Option<Feed>,
+    pending: &mut HashMap<PathBuf, String>,
+    job: &mut Option<Job>,
+    tts: &tts::Tts,
+    rm: &mut dyn Remover,
+) -> Deleted {
+    halt_audio_under(player, feed, pending, job, tts, dir);
+    let files = folder_files(dir);
+    delete_audio_files(&files, audio_dir, rm)
+}
+
+/// Open a folder in the system's file manager (Explorer on Windows, xdg-open/open elsewhere).
+fn open_folder(dir: &Path) {
+    let prog = if cfg!(target_os = "windows") { "explorer" } else if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+    let _ = std::process::Command::new(prog).arg(dir).spawn();
 }
 
 /// One voice folder's worth of the one-time audio renaming.
@@ -1426,10 +1714,14 @@ fn step_unit(b: &Book, u: &Unit, forward: bool) -> Option<Unit> {
         }
     }
 }
-
 fn scan_audio(b: &Book) -> Vec<AudioItem> {
+    scan_audio_in(b, &b.dir().join("audio"))
+}
+
+/// The same scan against an explicit audio folder (tests point it at a scratch tree).
+fn scan_audio_in(b: &Book, audio: &Path) -> Vec<AudioItem> {
     let mut out = Vec::new();
-    let Ok(profiles) = std::fs::read_dir(b.dir().join("audio")) else { return out };
+    let Ok(profiles) = std::fs::read_dir(audio) else { return out };
     let mut profiles: Vec<PathBuf> = profiles.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
     profiles.sort();
     for dir in profiles {
@@ -1444,16 +1736,137 @@ fn scan_audio(b: &Book) -> Vec<AudioItem> {
                 None => c.title.clone(),
                 Some(p) => format!("{} · page {}", c.title, p + 1),
             };
+            let (size, modified) = std::fs::metadata(&path).map_or((0, 0), |m| {
+                (m.len(), m.modified().map_or(0, |t| unix_secs(t)))
+            });
             out.push(AudioItem {
                 profile: profile.clone(),
                 duration: player::wav_duration(&path).unwrap_or(0.0),
                 unit: Unit { book: b.id.clone(), ch, pg },
                 path,
                 label,
+                size,
+                modified,
             });
         }
     }
+    // rows follow the book, whatever name form or voice folder the files sit in
+    out.sort_by(|a, b| (&a.profile, a.unit.ch, a.unit.pg).cmp(&(&b.profile, b.unit.ch, b.unit.pg)));
     out
+}
+
+/// Files under a book's audio folder that no generation owns any more: interrupted stream
+/// temp files, part-written files, estimated timings, timing files with no wav beside them,
+/// and audio whose key points at a section the book does not have (their timing files too).
+/// `busy` are the wav paths queued or being made right now; their temp files are left alone.
+fn scan_leftovers(b: &Book, busy: &HashSet<PathBuf>) -> Vec<JunkFile> {
+    scan_leftovers_in(b, &b.dir().join("audio"), busy)
+}
+
+/// The same scan against an explicit audio folder (tests point it at a scratch tree).
+fn scan_leftovers_in(b: &Book, audio: &Path, busy: &HashSet<PathBuf>) -> Vec<JunkFile> {
+    let mut out: Vec<JunkFile> = Vec::new();
+    let Ok(profiles) = std::fs::read_dir(audio) else { return out };
+    for dir in profiles.flatten().map(|e| e.path()).filter(|p| p.is_dir()) {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        let mut paths: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
+        paths.sort();
+        let wavs: HashSet<PathBuf> = paths.iter().filter(|p| p.extension().is_some_and(|e| e == "wav")).cloned().collect();
+        for p in &paths {
+            let Some(name) = p.file_name().and_then(|s| s.to_str()) else { continue };
+            // the wav a temp file belongs to, if it is one
+            let temp_of = name
+                .strip_suffix(".part")
+                .or_else(|| name.strip_suffix(".stream.pcm"))
+                .map(|base| dir.join(base.strip_suffix(".json").map(|j| format!("{j}.wav")).unwrap_or_else(|| base.to_string())));
+            let size = |p: &Path| std::fs::metadata(p).map_or(0, |m| m.len());
+            if let Some(wav) = temp_of {
+                if !busy.contains(&wav) {
+                    out.push(JunkFile { path: p.clone(), size: size(p) });
+                }
+            } else if name.ends_with(".json.estimated") {
+                out.push(JunkFile { path: p.clone(), size: size(p) });
+            } else if p.extension().is_some_and(|e| e == "json") && !wavs.contains(&p.with_extension("wav")) {
+                out.push(JunkFile { path: p.clone(), size: size(p) });
+            } else if p.extension().is_some_and(|e| e == "wav") {
+                // audio whose key points at a section the book does not have, with its timing
+                let gone = |p: &Path| {
+                    p.file_stem()
+                        .and_then(|s| s.to_str())
+                        .and_then(parse_unit_name)
+                        .is_some_and(|(ch, _)| b.chapters.get(ch).is_none())
+                };
+                if gone(p) && !busy.contains(p) {
+                    out.push(JunkFile { path: p.clone(), size: size(p) });
+                    let json = player::timing_path(p);
+                    let js = size(&json);
+                    if json.exists() && !out.iter().any(|j| j.path == json) {
+                        out.push(JunkFile { path: json, size: js });
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// How a deletion went: how many files moved, and the first one that could not, with its
+/// reason (a refusal to delete outside the audio folder, or the trash's complaint).
+struct Deleted {
+    moved: usize,
+    failed: Option<(PathBuf, String)>,
+}
+
+/// Delete `paths` (plus each wav's timing file) through `rm`, refusing anything outside
+/// `audio_dir`: a refused or failed file is left where it is. Missing files are skipped;
+/// the run carries on past a file that cannot be moved, so `moved` counts what went and
+/// `failed` names the first hold-out.
+fn delete_audio_files(paths: &[PathBuf], audio_dir: &Path, rm: &mut dyn Remover) -> Deleted {
+    let refuse = |p: &Path, why: String| Deleted { moved: 0, failed: Some((p.to_path_buf(), why)) };
+    let Ok(root) = audio_dir.canonicalize() else {
+        return refuse(audio_dir, format!("{}: no such folder", audio_dir.display()));
+    };
+    let (mut todo, mut seen) = (Vec::new(), Vec::new());
+    for p in paths {
+        for f in [p, &player::timing_path(p)] {
+            // canonicalize also skips files that are already gone; the resolved form is
+            // only for the inside-the-folder check, because the shell trash API on Windows
+            // rejects verbatim (\\?\) paths, so the remover gets the path as it was built
+            let Ok(c) = f.canonicalize() else { continue };
+            if !c.starts_with(&root) {
+                return refuse(f, "it is outside the book's audio folder".into());
+            }
+            if !seen.contains(&c) {
+                seen.push(c);
+                todo.push(f.clone());
+            }
+        }
+    }
+    if todo.is_empty() {
+        return Deleted { moved: 0, failed: None };
+    }
+    // one trash operation for the whole group; if it fails, work out file by file what held out
+    if rm.remove_all(&todo).is_ok() {
+        return Deleted { moved: todo.len(), failed: None };
+    }
+    let (mut moved, mut failed) = (0, None);
+    for p in &todo {
+        if !p.exists() {
+            moved += 1; // it went with the group after all
+            continue;
+        }
+        match rm.remove(p) {
+            Ok(()) => moved += 1,
+            Err(e) if failed.is_none() => failed = Some((p.clone(), e)),
+            Err(_) => {}
+        }
+    }
+    Deleted { moved, failed }
+}
+
+/// Unix seconds of a file timestamp (0 when before the epoch).
+fn unix_secs(t: std::time::SystemTime) -> u64 {
+    t.duration_since(std::time::SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
 impl eframe::App for App {
@@ -1663,6 +2076,240 @@ mod tests {
             }
         }
     }
+    // ---- audio management ----
+
+    /// Plain removal inside the test's own tree; tests never touch the Recycle Bin.
+    struct PlainRemove;
+    impl Remover for PlainRemove {
+        fn remove(&mut self, path: &Path) -> Result<(), String> {
+            std::fs::remove_file(path).map_err(|e| e.to_string())
+        }
+    }
+
+    /// A minimal 16-bit mono wav of `bytes` bytes (24000 Hz), so scans see a real size.
+    pub(crate) fn wav_bytes(bytes: usize) -> Vec<u8> {
+        let mut w = vec![0u8; bytes.max(44)];
+        let data = (w.len() - 44) as u32;
+        w[4..8].copy_from_slice(&data.to_le_bytes());
+        w[8..12].copy_from_slice(b"WAVE");
+        w[12..16].copy_from_slice(b"fmt ");
+        w[16..20].copy_from_slice(&16u32.to_le_bytes());
+        w[20..22].copy_from_slice(&1u16.to_le_bytes());
+        w[22..24].copy_from_slice(&1u16.to_le_bytes());
+        w[24..28].copy_from_slice(&24000u32.to_le_bytes());
+        w[28..32].copy_from_slice(&48000u32.to_le_bytes());
+        w[32..34].copy_from_slice(&2u16.to_le_bytes());
+        w[34..36].copy_from_slice(&16u16.to_le_bytes());
+        w[36..40].copy_from_slice(b"data");
+        w[40..44].copy_from_slice(&data.to_le_bytes());
+        w
+    }
+
+    /// A scratch book folder with an audio tree, returned as (book dir, book, audio dir).
+    /// Nothing here goes through INKVOICE_DATA; every scan and delete takes the folder.
+    fn audio_tree(tag: &str) -> (PathBuf, book::Book, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("inkvoice-test-audio-{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let b = book::Book {
+            id: "quiet_harbor-9f6689e3".into(),
+            title: "Quiet Harbor".into(),
+            author: String::new(),
+            source: String::new(),
+            chapters: vec![
+                book::Chapter::new("Title Page".into(), vec!["t".into()]),
+                book::Chapter::new("The Quiet Harbor".into(), vec!["a".into(), "b".into()]),
+            ],
+            pos: (0, 0),
+            opened: 0,
+            listen: None,
+        };
+        let audio = dir.join("audio");
+        (dir, b, audio)
+    }
+
+    fn put(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let p = dir.join(name);
+        std::fs::write(&p, bytes).unwrap();
+        p
+    }
+
+    #[test]
+    fn scans_audio_with_sizes_and_book_order() {
+        let (_dir, b, audio) = audio_tree("scan");
+        let kokoro = audio.join("kokoro-af_heart");
+        let phonon = audio.join("phonon-everly");
+        put(&kokoro, "00_Title_Page_c0000.wav", &wav_bytes(4096));
+        put(&kokoro, "01_The_Quiet_Harbor_c0001_p0001.wav", &wav_bytes(8192));
+        put(&kokoro, "01_The_Quiet_Harbor_c0001_p0000.wav", &wav_bytes(8192));
+        // the old bare name form still reads, and sorts where it belongs
+        put(&phonon, "c0001.wav", &wav_bytes(2048));
+        // a wav of a section the book does not have is not listed (it is a leftover)
+        put(&kokoro, "09_Ghost_c0009.wav", &wav_bytes(4096));
+        put(&kokoro, "notes.txt", b"x");
+
+        let items = scan_audio_in(&b, &audio);
+        let rows: Vec<(&str, usize, Option<usize>, u64)> =
+            items.iter().map(|i| (i.profile.as_str(), i.unit.ch, i.unit.pg, i.size)).collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("kokoro-af_heart", 0, None, 4096),
+                ("kokoro-af_heart", 1, Some(0), 8192),
+                ("kokoro-af_heart", 1, Some(1), 8192),
+                ("phonon-everly", 1, None, 2048),
+            ]
+        );
+        assert_eq!(items[1].label, "The Quiet Harbor · page 1");
+        assert!(items.iter().all(|i| i.modified > 0), "the scan gathers modification times");
+        assert!(items.iter().all(|i| i.duration > 0.0), "the scan reads durations from the headers");
+    }
+
+    #[test]
+    fn finds_leftovers_of_each_kind() {
+        let (_dir, b, audio) = audio_tree("leftovers");
+        let v = audio.join("kokoro-af_heart");
+        // real audio of section 0, and its timing
+        put(&v, "00_Title_Page_c0000.wav", &wav_bytes(4096));
+        put(&v, "00_Title_Page_c0000.json", b"{}");
+        // a stream of a running generation: not a leftover, its part file neither
+        put(&v, "01_The_Quiet_Harbor_c0001.wav.stream.pcm", b"pcm");
+        put(&v, "01_The_Quiet_Harbor_c0001.json.part", b"{}");
+        // an interrupted first generation: a stream temp with no wav at all
+        put(&v, "c0001_p0000.wav.stream.pcm", b"pcm");
+        // every other leftover kind
+        put(&v, "00_Title_Page_c0000.wav.part", b"wav");
+        put(&v, "00_Title_Page_c0000.json.estimated", b"{}");
+        put(&v, "09_Ghost_c0009.json", b"{}"); // timing with no wav beside it
+        put(&v, "09_Ghost_c0009.wav", &wav_bytes(4096));
+
+        let busy: HashSet<PathBuf> = [audio.join("kokoro-af_heart/01_The_Quiet_Harbor_c0001.wav")]
+            .into_iter()
+            .collect();
+        let junk: Vec<PathBuf> = scan_leftovers_in(&b, &audio, &busy).into_iter().map(|j| j.path).collect();
+        let names: Vec<String> = junk.iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "00_Title_Page_c0000.json.estimated",
+                "00_Title_Page_c0000.wav.part",
+                "09_Ghost_c0009.wav",
+                "09_Ghost_c0009.json",
+                "c0001_p0000.wav.stream.pcm",
+            ]
+        );
+        assert!(!names.contains(&"00_Title_Page_c0000.wav".to_string()) && !names.contains(&"00_Title_Page_c0000.json".to_string()), "real audio stays");
+        assert!(!names.contains(&"01_The_Quiet_Harbor_c0001.json.part".to_string()), "nor is the part file of a running generation");
+        let _ = std::fs::remove_dir_all(audio.parent().unwrap());
+    }
+
+
+    #[test]
+    fn deleting_one_unit_takes_wav_and_json_only() {
+        let (_dir, _b, audio) = audio_tree("one");
+        let v = audio.join("kokoro-af_heart");
+        let wav0 = put(&v, "00_Title_Page_c0000.wav", &wav_bytes(4096));
+        put(&v, "00_Title_Page_c0000.json", b"{}");
+        let wav1 = put(&v, "01_The_Quiet_Harbor_c0001.wav", &wav_bytes(4096));
+        put(&v, "01_The_Quiet_Harbor_c0001.json", b"{}");
+        let other = put(&audio.join("phonon-everly"), "01_The_Quiet_Harbor_c0001.wav", &wav_bytes(4096));
+
+        let r = delete_audio_files(&[wav0], &audio, &mut PlainRemove);
+        assert_eq!((r.moved, r.failed.is_none()), (2, true), "the wav and its timing file");
+        assert!(!v.join("00_Title_Page_c0000.wav").exists() && !v.join("00_Title_Page_c0000.json").exists());
+        assert!(wav1.exists() && other.exists(), "other files are untouched");
+        let _ = std::fs::remove_dir_all(audio.parent().unwrap());
+    }
+
+    #[test]
+    fn deleting_a_voice_stops_its_generation_and_takes_its_temp_files() {
+        let (_dir, _b, audio) = audio_tree("voice");
+        let v = audio.join("kokoro-af_heart");
+        put(&v, "00_Title_Page_c0000.wav", &wav_bytes(4096));
+        put(&v, "00_Title_Page_c0000.json", b"{}");
+        let queued = v.join("01_The_Quiet_Harbor_c0001.wav"); // queued, its stream temp on disk
+        put(&v, "01_The_Quiet_Harbor_c0001.wav.stream.pcm", b"pcm");
+        let other = put(&audio.join("phonon-everly"), "01_The_Quiet_Harbor_c0001.wav", &wav_bytes(4096));
+        let tts = tts::Tts::start(vec!["no-such-engine".into()], None, eframe::egui::Context::default());
+        let mut pending = HashMap::from([(queued.clone(), "The Quiet Harbor".into())]);
+        let mut job = Some(Job { path: queued.clone(), progress: 0.4, started: Instant::now() });
+
+        let r = clear_audio_dir(&v, &audio, &mut None, &mut None, &mut pending, &mut job, &tts, &mut PlainRemove);
+        assert_eq!((r.moved, r.failed.is_none()), (3, true), "two files and the stream temp");
+        assert!(pending.is_empty() && job.is_none(), "the queued unit was cancelled and cleared");
+        assert_eq!(std::fs::read_dir(&v).unwrap().count(), 0, "the voice folder is empty");
+        assert!(other.exists(), "other voices are untouched");
+        let _ = std::fs::remove_dir_all(audio.parent().unwrap());
+    }
+
+    #[test]
+    fn deleting_all_book_audio_keeps_the_book_itself() {
+        let (dir, _b, audio) = audio_tree("book");
+        put(&audio.join("kokoro-af_heart"), "00_Title_Page_c0000.wav", &wav_bytes(4096));
+        put(&audio.join("kokoro-af_heart"), "00_Title_Page_c0000.json", b"{}");
+        put(&audio.join("phonon-everly"), "c0001.wav", &wav_bytes(4096));
+        put(&audio.join("phonon-everly"), "c0001.json", b"{}");
+        let keep = put(&dir, "book.json", b"{}");
+        put(&dir, "progress.json", br#"{"ch":0,"pg":0,"opened":0}"#);
+        put(&dir, "cover.png", b"png");
+
+        let tts = tts::Tts::start(vec!["no-such-engine".into()], None, eframe::egui::Context::default());
+        let mut pending = HashMap::new();
+        let r = clear_audio_dir(&audio, &audio, &mut None, &mut None, &mut pending, &mut None, &tts, &mut PlainRemove);
+        assert_eq!((r.moved, r.failed.is_none()), (4, true), "every voice's files");
+        assert!(keep.exists() && dir.join("progress.json").exists() && dir.join("cover.png").exists());
+        assert!(!audio.join("kokoro-af_heart").join("00_Title_Page_c0000.wav").exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cleaning_up_removes_only_leftovers() {
+        let (_dir, b, audio) = audio_tree("clean");
+        let v = audio.join("kokoro-af_heart");
+        put(&v, "00_Title_Page_c0000.wav", &wav_bytes(4096));
+        put(&v, "00_Title_Page_c0000.json", b"{}");
+        put(&v, "00_Title_Page_c0000.wav.stream.pcm", b"pcm"); // interrupted stream
+        put(&v, "09_Ghost_c0009.json", b"{}"); // timing with no wav
+
+        let junk: Vec<PathBuf> = scan_leftovers_in(&b, &audio, &HashSet::new()).into_iter().map(|j| j.path).collect();
+        let r = delete_audio_files(&junk, &audio, &mut PlainRemove);
+        assert_eq!((r.moved, r.failed.is_none()), (2, true));
+        assert!(v.join("00_Title_Page_c0000.wav").exists() && v.join("00_Title_Page_c0000.json").exists());
+        assert!(!v.join("00_Title_Page_c0000.wav.stream.pcm").exists() && !v.join("09_Ghost_c0009.json").exists());
+        let _ = std::fs::remove_dir_all(audio.parent().unwrap());
+    }
+
+    #[test]
+    fn refuses_to_delete_outside_the_audio_folder() {
+        let (dir, _b, audio) = audio_tree("refuse");
+        let v = audio.join("kokoro-af_heart");
+        let wav = put(&v, "00_Title_Page_c0000.wav", &wav_bytes(4096));
+        let cover = put(&dir, "cover.png", b"png");
+
+        // the cover sits outside the audio folder, reached directly and through ".."
+        for escape in [dir.join("cover.png"), audio.join("..").join("cover.png")] {
+            let r = delete_audio_files(&[escape], &audio, &mut PlainRemove);
+            assert_eq!(r.moved, 0, "nothing is deleted");
+            assert!(r.failed.is_some(), "the attempt is refused");
+        }
+        assert!(cover.exists(), "the outside file is untouched");
+        assert!(wav.exists(), "and so is everything inside");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// After deleting a unit whose generation was queued or running, nothing marks it as
+    /// wanted any more, so it can be queued again.
+    #[test]
+    fn deleting_a_queued_unit_can_be_queued_again() {
+        let tts = tts::Tts::start(vec!["no-such-engine".into()], None, eframe::egui::Context::default());
+        let wav = PathBuf::from("books/quiet_harbor-9f6689e3/audio/kokoro-af_heart/01_The_Quiet_Harbor_c0001.wav");
+        let mut pending = HashMap::from([(wav.clone(), "The Quiet Harbor".into())]);
+        let mut job = Some(Job { path: wav.clone(), progress: 0.4, started: Instant::now() });
+        let mut feed = Some(Feed { out: wav.clone(), pcm: wav.clone(), read: 6 });
+        halt_unit_audio(&mut None, &mut feed, &mut pending, &mut job, &wav, &tts);
+        assert!(pending.is_empty() && job.is_none() && feed.is_none());
+    }
+
     #[test]
     fn profile_labels() {
         assert_eq!(config::profile_label("phonon-everly"), "Phonon · Everly");
@@ -1743,9 +2390,32 @@ mod screenshots {
         if !scratch(&dir) {
             return;
         }
-        fixture_book().save().unwrap();
+        let mut book = fixture_book();
+        book.chapters[4].title = "Section 3 - The Long Crossing Home from the Islands".into();
+        book.save().unwrap();
         // audio of an earlier run would make every page "ready"; start from scratch
         let _ = std::fs::remove_dir_all(book::books_dir().join("shots_book").join("audio"));
+        // the audio manager needs something to show: a few small wavs in two voice folders
+        // (the default voice first, so its rows offer regenerate), one long title, and one
+        let wav = |bytes: usize| crate::tests::wav_bytes(bytes);
+        let audio = book::books_dir().join("shots_book/audio");
+        for (profile, ch, bytes) in [
+            ("kokoro-af_heart", 2usize, 1_258_291usize),
+            ("kokoro-af_heart", 3, 943_718),
+            ("kokoro-af_heart", 4, 1_677_721),
+            ("phonon-everly", 2, 1_153_433),
+        ] {
+            let dir = audio.join(profile);
+            std::fs::create_dir_all(&dir).unwrap();
+            let wav_p = dir.join(format!("{}.wav", unit_stem(&book, ch, None)));
+            std::fs::write(&wav_p, wav(bytes)).unwrap();
+            std::fs::write(wav_p.with_extension("json"), br#"{"duration": 12.3, "words": []}"#).unwrap();
+        }
+        std::fs::write(
+            audio.join("kokoro-af_heart").join(format!("{}.wav.stream.pcm", unit_stem(&book, 5, None))),
+            vec![0u8; 209_715],
+        )
+        .unwrap();
         let save = |h: &mut Harness<App>, name: &str| {
             h.run_steps(4);
             h.render().unwrap().save(format!("{dir}/{name}.png")).unwrap();
@@ -1755,6 +2425,12 @@ mod screenshots {
         let shot_ch: usize = std::env::var("SHOT_CH").ok().and_then(|c| c.parse().ok()).unwrap_or(3); // a body section; the fixture now opens with two skipped sections
         h.state_mut().sel = Some(id.clone());
         save(&mut h, "1_library");
+
+        // the audio manager: rows with sizes and dates, then its delete confirmation
+        save(&mut h, "audio_manager");
+        h.state_mut().ask_del_all(&id, DelAll::Voice("kokoro-af_heart".into()));
+        save(&mut h, "audio_delete_confirm");
+        h.state_mut().confirm_del_audio = None;
 
         let s = h.state_mut();
         s.open_reader(&id);

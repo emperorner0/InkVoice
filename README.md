@@ -60,6 +60,10 @@ This repository is a fork of [sabeel111/InkVoice](https://github.com/sabeel111/I
 - Short book folder names (`<title-slug>-<8 hex>`) and readable audio file names
   (`03_The_Quiet_Harbor_c0003.wav`), moved over once at start-up; audio lookups go by the chapter key, so
   old names and title changes never orphan a file.
+- Audio manager in the book details panel: every generated file per voice with its size, duration and
+  date, delete and regenerate per section, delete all for a voice or the whole book, a clean-up for
+  leftover files, and a button that opens a voice's folder in the file manager. Deleted files go to the
+  Recycle Bin, where they can be restored. See [docs/managing-audio.md](docs/managing-audio.md).
 
 ## Install
 
