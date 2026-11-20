@@ -1,9 +1,13 @@
 # InkVoice
 
-**[Website & downloads](https://sabeel111.github.io/InkVoice/)**
+This is a fork of [sabeel111/InkVoice](https://github.com/sabeel111/InkVoice) with a cloned-voice engine,
+a pronunciation helper, audio management and export added. See [What this fork adds](#what-this-fork-adds)
+and its [known issues](#known-issues). Downloads are on this fork's
+[Releases](https://github.com/emperorner0/InkVoice/releases) page.
 
 A tiny, dark-mode ebook reader that turns your EPUB and PDF books into audiobooks — with small
-text-to-speech models running entirely on your own machine. No cloud, no Electron, no PyTorch.
+text-to-speech models running entirely on your own machine. No cloud, no Electron, and no PyTorch unless
+you choose the optional Qwen3 engine.
 
 ![Reader with word highlighting](docs/screenshots/5_streaming.png)
 
@@ -24,8 +28,10 @@ text-to-speech models running entirely on your own machine. No cloud, no Electro
   | [Kokoro](https://huggingface.co/hexgrad/Kokoro-82M) 82M (ONNX) | 115 MB | 28 English voices (US/UK) | Apache-2.0 |
   | [Phonon](https://gradium.ai/phonon) 31M | 125 MB | 24 English voices, ~2–4× real time on CPU | Apache-2.0 |
   | [Underdog Woof](https://huggingface.co/ConwayResearch/Underdog-Woof) | 41 MB | 2 voices, numpy only | **Non-commercial** |
+  | [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) 0.6B (this fork) | 7 GB | a voice cloned from your own sample; needs an NVIDIA GPU | Apache-2.0 |
 
-  Engines are installed from inside the app (Settings → Voice engines); no PyTorch, no GPU needed.
+  Engines are installed from inside the app (Settings → Voice engines). The first three need no PyTorch and
+  no GPU.
 
 - **Natural pacing** — whole paragraphs per generation step, trimmed model silences, adjustable pauses.
 - **Advanced settings** per engine (temperature, weights, sentence splitting, …) and *Regenerate audio* per chapter.
@@ -65,23 +71,40 @@ This repository is a fork of [sabeel111/InkVoice](https://github.com/sabeel111/I
   age, delete and regenerate per section, delete all for a voice or the whole book, a clean-up for
   leftover files, and a button that opens a voice's folder in the file manager. Deleted files go to the
   Recycle Bin, where they can be restored. See [docs/managing-audio.md](docs/managing-audio.md).
+- Export from the audio manager: one voice's audio of a book as one WAV file per chapter, or as a single M4B
+  with chapter markers, title, author and cover when `ffmpeg` is installed. The library is not changed. See
+  [docs/exporting.md](docs/exporting.md).
+
+### Known issues
+
+- The fork has been built and used on Windows 11 only. The Linux package is produced by the same build
+  workflow but has not been run.
+- Installing the Qwen3 engine from inside the app has not been tested; it was set up by hand during
+  development. It lists one voice, `narrator`, and reads English only.
+- The optional language-model pass of the pronunciation helper is unreliable on some words with the small
+  local model that was tested: on real sentences it chose the right reading of "read" 5 times out of 13. The
+  built-in rules and the pronunciation table do not have this problem and are the recommended way to use it.
+- The pronunciation table does not match a word that is joined to another by a dash with no spaces.
+- PDFs are imported as fixed 10-page chunks, so front and back matter is rarely recognised in them.
+- Renaming a section later does not rename audio files that already exist; they keep working.
+- Export has been tested on a short generated book, not on a full-length one. M4B export needs `ffmpeg`
+  installed separately and was tried with ffmpeg 4.2 only; MP3 and FLAC are not offered.
 
 ## Install
 
-### Linux (x86_64)
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/sabeel111/InkVoice/main/packaging/linux/get.sh | sh
-```
-
-Or download `inkvoice-linux-x86_64.tar.gz` from [Releases](https://github.com/sabeel111/InkVoice/releases),
-unpack it and run `./install.sh` (installs for your user, no root). `./install.sh --uninstall` removes it.
-
 ### Windows 10/11 (x64)
 
-Download **`InkVoice-Setup-x86_64.exe`** from [Releases](https://github.com/sabeel111/InkVoice/releases) and run it
-(no admin rights needed), or use the portable zip. Windows may show a SmartScreen warning because the app
-isn't code-signed yet — choose *More info → Run anyway*.
+Download **`InkVoice-Setup-x86_64.exe`** from this fork's
+[Releases](https://github.com/emperorner0/InkVoice/releases) and run it (no admin rights needed), or use the
+portable zip. Windows may show a SmartScreen warning because the app isn't code-signed; choose
+*More info → Run anyway*. Open InkVoice from the Start menu when setup has finished.
+
+### Linux (x86_64)
+
+Download `inkvoice-linux-x86_64.tar.gz` from this fork's
+[Releases](https://github.com/emperorner0/InkVoice/releases), unpack it and run `./install.sh` (installs for
+your user, no root). `./install.sh --uninstall` removes it. This package is untested; see the known issues.
+The original project's one-line installer installs the original InkVoice, without the additions of this fork.
 
 ### Voices
 
@@ -92,7 +115,7 @@ system-wide and no Python knowledge is needed. Remove engines there too.
 ### Build from source
 
 ```sh
-git clone https://github.com/sabeel111/InkVoice.git && cd InkVoice
+git clone https://github.com/emperorner0/InkVoice.git && cd InkVoice
 cargo build --release          # Linux needs ALSA headers (libasound2-dev / alsa-lib)
 ./target/release/inkvoice
 ```
@@ -115,28 +138,35 @@ Open a book directly with `inkvoice path/to/book.epub`, or import headlessly wit
 ## How it works
 
 ```
-src/main.rs      app state: library, queue, playback, streaming, follow-along
+src/main.rs      app state: library, queue, playback, streaming, follow-along, audio management
 src/ui.rs        all drawing (library, reader, player bar, settings)
-src/book.rs      EPUB/PDF import, pagination, covers, reading progress
+src/book.rs      EPUB/PDF import, pagination, covers, reading progress, book folders
+src/sections.rs  what each section of a book is, and which ones are skipped when listening
+src/export.rs    export of a book's audio to WAV files or an M4B
 src/player.rs    audio output, growing stream buffer, WSOLA speed change
 src/tts.rs       talks to a voice worker over JSON lines (priority queue, cancel)
-src/config.rs    settings, engines, voices, advanced parameters
+src/config.rs    settings, engines, voices, advanced parameters, the pronunciation table
 src/installer.rs installs voice engines: uv → private Python → packages → model files
-workers/         Python voice workers — common.py does pacing, word timing and streaming
+workers/         Python voice workers — common.py does pacing, word timing and streaming;
+                 spoken_rules.py and normalizer.py are the pronunciation helper, aligner.py measures
+                 word timings for the Qwen3 engine
 ```
 
 Each engine is a small worker process; the UI never links a model, so engines can be swapped,
 added or removed without touching the app. Word timings are estimated by matching punctuation to the
-pauses detected in the audio.
+pauses detected in the audio; the Qwen3 engine measures them against the audio instead.
 
 Data lives in `~/.local/share/inkvoice` (Windows: `%LOCALAPPDATA%\inkvoice`) — books, audio, voice engines —
-and settings in `~/.config/inkvoice/config.json` (Windows: `%APPDATA%\inkvoice`).
+and settings in `~/.config/inkvoice/config.json` (Windows: `%APPDATA%\inkvoice`). Set `INKVOICE_DATA` and
+`INKVOICE_CONFIG` to use other folders.
 
 ## License
 
-InkVoice is released under the [MIT License](LICENSE).
+InkVoice is released under the [MIT License](LICENSE). Material adapted from other projects is listed in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## Model licenses
 
 The models are downloaded by the app when you install an engine; they are not stored in this repository. Underdog Woof is free for
-non-commercial use only; Phonon (31M English) and Kokoro are Apache-2.0.
+non-commercial use only; Phonon (31M English) and Kokoro are Apache-2.0. The Qwen3 engine downloads Qwen3-TTS
+and the wav2vec2 model it uses for word timings, both Apache-2.0.
