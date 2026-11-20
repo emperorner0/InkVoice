@@ -15,7 +15,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 dirs = "6"
 deunicode = "1"
-epub = "2"
+rbook = { version = "0.7", default-features = false, features = ["threadsafe"] }
 html2text = "0.14"
 pdf-extract = "0.9"
 anyhow = "1"

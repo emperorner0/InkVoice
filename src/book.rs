@@ -337,31 +337,43 @@ pub fn import(path: &Path) -> Result<Book> {
 }
 
 fn import_epub(path: &Path, stem: &str) -> Result<(Book, Option<Vec<u8>>)> {
-    let mut doc = epub::doc::EpubDoc::new(path)?;
-    let title = doc.mdata("title").map(|m| m.value.trim().to_string()).unwrap_or_else(|| stem.to_string());
-    let author = doc.mdata("creator").map(|m| m.value.trim().to_string()).unwrap_or_default();
-    let cover = doc.get_cover().map(|(bytes, _mime)| bytes);
+    let doc = rbook::Epub::open(path)?;
+    let title = doc.metadata().title().map(|m| m.value().trim().to_string()).unwrap_or_else(|| stem.to_string());
+    let author = doc.metadata().creators().next().map(|m| m.value().trim().to_string()).unwrap_or_default();
+    let cover = doc.manifest().cover_image().and_then(|c| c.read_bytes().ok());
     // Prefer the book's own table of contents (real chapter titles, and chapters that share a
     // file are split at their anchors); fall back to one chapter per file.
-    let mut chapters = chapters_from_toc(&mut doc);
+    let mut chapters = chapters_from_toc(&doc);
     if chapters.len() < 2 {
-        chapters = chapters_from_spine(&mut doc);
+        chapters = chapters_from_spine(&doc);
     }
     Ok((Book { id: String::new(), title, author, source: String::new(), chapters, pos: (0, 0), opened: 0, listen: None }, cover))
 }
 
 /// One chapter per spine file, titled from its first line.
-fn chapters_from_spine(doc: &mut epub::doc::EpubDoc<std::io::BufReader<std::fs::File>>) -> Vec<Chapter> {
+fn chapters_from_spine(doc: &rbook::Epub) -> Vec<Chapter> {
+    let marks = landmark_markers(doc);
     let mut chapters = Vec::new();
-    for i in 0..doc.spine.len() {
-        doc.set_current_chapter(i);
-        let Some((html, _)) = doc.get_current_str() else { continue };
+    for entry in doc.spine() {
+        let Some(m) = entry.manifest_entry() else { continue };
+        let Ok(html) = doc.read_resource_str(m.resource()) else { continue };
         let text = html_to_text(&html);
         if text.chars().count() < 80 {
             continue;
         }
+        // a landmark onto this file marks the chapter that starts at it, fragment or not
+        let file = m.href();
+        let marker = marks
+            .iter()
+            .find(|(f, fr, _)| f.as_str() == file.as_str() && fr.is_none())
+            .or_else(|| marks.iter().find(|(f, _, _)| f.as_str() == file.as_str()))
+            .map(|(_, _, k)| *k)
+            .or_else(|| body_marker(&html))
+            .or_else(|| (!entry.is_linear()).then_some("nonlinear"));
         let title = title_from_text(&text).unwrap_or_else(|| format!("Section {}", chapters.len() + 1));
-        chapters.push(Chapter::new(title, paginate(&text)));
+        let mut ch = Chapter::new(title, paginate(&text));
+        ch.marker = marker.map(str::to_string);
+        chapters.push(ch);
     }
     chapters
 }
@@ -375,39 +387,34 @@ fn title_from_text(text: &str) -> Option<String> {
     (first.chars().count() <= 70).then(|| first.to_string())
 }
 
-fn chapters_from_toc(doc: &mut epub::doc::EpubDoc<std::io::BufReader<std::fs::File>>) -> Vec<Chapter> {
+fn chapters_from_toc(doc: &rbook::Epub) -> Vec<Chapter> {
     // flatten the TOC: (label, file, fragment)
-    fn flat(n: &[epub::doc::NavPoint], out: &mut Vec<(String, PathBuf, Option<String>)>) {
-        for p in n {
-            let s = p.content.to_string_lossy().into_owned();
-            let (file, frag) = match s.split_once('#') {
-                Some((f, fr)) => (PathBuf::from(f), Some(fr.to_string())),
-                None => (PathBuf::from(&s), None),
-            };
-            let label = p.label.split_whitespace().collect::<Vec<_>>().join(" ");
-            out.push((label, file, frag));
-            flat(&p.children, out);
+    let mut toc: Vec<(String, String, Option<String>)> = Vec::new();
+    if let Some(nav) = doc.toc().contents() {
+        for p in nav.flatten() {
+            let Some(href) = p.href() else { continue };
+            let label = p.label().split_whitespace().collect::<Vec<_>>().join(" ");
+            toc.push((label, href.path().as_str().to_string(), href.fragment().map(str::to_string)));
         }
     }
-    let mut toc = Vec::new();
-    let nav = doc.toc.clone();
-    flat(&nav, &mut toc);
     if toc.len() < 2 {
         return Vec::new();
     }
+    let marks = landmark_markers(doc);
 
-    // (title, text) in reading order; text before a file's first anchor continues the previous chapter
-    let mut parts: Vec<(String, String)> = Vec::new();
-    let spine: Vec<String> = doc.spine.iter().map(|s| s.idref.clone()).collect();
-    for idref in spine {
-        let Some(file) = doc.resources.get(&idref).map(|r| r.path.clone()) else { continue };
-        let Some(html) = doc.get_resource_str_by_path(&file) else { continue };
-        let mut cuts: Vec<(usize, String)> = toc
+    // (title, text, marker) in reading order; text before a file's first anchor continues the previous chapter
+    let mut parts: Vec<(String, String, Option<&'static str>)> = Vec::new();
+    for entry in doc.spine() {
+        let Some(m) = entry.manifest_entry() else { continue };
+        let Ok(html) = doc.read_resource_str(m.resource()) else { continue };
+        let file = m.href().as_str().to_string();
+        let doc_type = body_marker(&html);
+        let mut cuts: Vec<(usize, &str, Option<&str>)> = toc
             .iter()
-            .filter(|(_, f, _)| *f == file)
-            .filter_map(|(label, _, frag)| match frag {
-                None => Some((0, label.clone())),
-                Some(fr) => anchor_pos(&html, fr).map(|p| (p, label.clone())),
+            .filter(|(_, f, _)| f == &file)
+            .filter_map(|(label, _, frag)| match frag.as_deref() {
+                None => Some((0, label.as_str(), None)),
+                Some(fr) => anchor_pos(&html, fr).map(|p| (p, label.as_str(), Some(fr))),
             })
             .collect();
         cuts.sort_by_key(|c| c.0);
@@ -424,20 +431,39 @@ fn chapters_from_toc(doc: &mut epub::doc::EpubDoc<std::io::BufReader<std::fs::Fi
                         last.1.push_str("\n\n");
                         last.1.push_str(&text);
                     }
-                    None => parts.push((title_from_text(&text).unwrap_or_else(|| "Beginning".into()), text)),
+                    None => {
+                        let marker = marks
+                            .iter()
+                            .find(|(f, fr, _)| f == &file && fr.is_none())
+                            .map(|(_, _, k)| *k)
+                            .or(doc_type)
+                            .or((!entry.is_linear()).then_some("nonlinear"));
+                        parts.push((title_from_text(&text).unwrap_or_else(|| "Beginning".into()), text, marker));
+                    }
                 }
             }
         }
-        for (k, (start, label)) in cuts.iter().enumerate() {
+        for (k, (start, label, frag)) in cuts.iter().enumerate() {
             let text = html_to_text(&html[*start..bounds[k + 1]]);
-            parts.push((label.clone(), text));
+            let marker = marks
+                .iter()
+                .find(|(f, fr, _)| f == &file && fr.as_deref() == *frag)
+                .map(|(_, _, k)| *k)
+                .or(doc_type)
+                .or((!entry.is_linear()).then_some("nonlinear"));
+            parts.push((label.to_string(), text, marker));
         }
     }
     parts
         .into_iter()
-        .filter(|(_, t)| t.trim().chars().count() >= 20)
-        .map(|(title, text)| {
-            Chapter::new(if title.is_empty() { "Untitled".into() } else { title.chars().take(80).collect() }, paginate(text.trim()))
+        .filter(|(_, t, _)| t.trim().chars().count() >= 20)
+        .map(|(title, text, marker)| {
+            let mut ch = Chapter::new(
+                if title.is_empty() { "Untitled".into() } else { title.chars().take(80).collect() },
+                paginate(text.trim()),
+            );
+            ch.marker = marker.map(str::to_string);
+            ch
         })
         .collect()
 }
@@ -453,6 +479,79 @@ fn anchor_pos(html: &str, frag: &str) -> Option<usize> {
         }
     }
     None
+}
+
+/// Markers from the EPUB 3 landmarks nav or, failing that, the EPUB 2 OPF guide (rbook serves
+/// both as the "landmarks" group, the nav winning when both exist): (file, fragment, marker).
+fn landmark_markers(doc: &rbook::Epub) -> Vec<(String, Option<String>, &'static str)> {
+    let mut marks = Vec::new();
+    if let Some(root) = doc.toc().landmarks() {
+        for e in root.flatten() {
+            let marker = marker_term(e.kind_raw().unwrap_or_default());
+            if let (Some(href), Some(marker)) = (e.href(), marker) {
+                marks.push((href.path().as_str().to_string(), href.fragment().map(str::to_string), marker));
+            }
+        }
+    }
+    marks
+}
+
+/// Map a landmark/guide type or `epub:type` onto the marker vocabulary; None for other terms.
+fn marker_term(raw: &str) -> Option<&'static str> {
+    raw.split_whitespace().find_map(|t| {
+        Some(match t.to_ascii_lowercase().as_str() {
+            "cover" => "cover",
+            "titlepage" | "title-page" => "titlepage",
+            "toc" => "toc",
+            "copyright-page" | "copyright" => "copyright-page",
+            "dedication" => "dedication",
+            "epigraph" => "epigraph",
+            "foreword" => "foreword",
+            "preface" => "preface",
+            "introduction" => "introduction",
+            "acknowledgments" | "acknowledgements" => "acknowledgments",
+            "afterword" => "afterword",
+            "colophon" => "colophon",
+            "bibliography" => "bibliography",
+            "index" => "index",
+            "glossary" => "glossary",
+            "endnotes" | "notes" => "endnotes",
+            "frontmatter" => "frontmatter",
+            "bodymatter" | "text" => "bodymatter",
+            "backmatter" => "backmatter",
+            _ => return None,
+        })
+    })
+}
+
+/// `epub:type` on the `<body>`, else on the first sectioning element, when it names a section.
+fn body_marker(html: &str) -> Option<&'static str> {
+    let at = tag_pos(html, "body")
+        .or_else(|| ["article", "aside", "nav", "section"].iter().filter_map(|t| tag_pos(html, t)).min())?;
+    let end = at + html[at..].find('>')?;
+    attr_value(&html[at..end], "epub:type").and_then(marker_term)
+}
+
+/// Byte offset of `<tag`, when it is not the prefix of a longer tag name.
+fn tag_pos(html: &str, tag: &str) -> Option<usize> {
+    let needle = format!("<{tag}");
+    let mut from = 0;
+    while let Some(i) = html[from..].find(&needle) {
+        let at = from + i;
+        let after = html[at + needle.len()..].chars().next().unwrap_or(' ');
+        if !after.is_ascii_alphanumeric() {
+            return Some(at);
+        }
+        from = at + needle.len();
+    }
+    None
+}
+
+/// Value of a quoted attribute inside one tag.
+fn attr_value<'a>(tag: &'a str, attr: &str) -> Option<&'a str> {
+    let rest = tag.find(attr).map(|i| tag[i + attr.len()..].trim_start())?.strip_prefix('=')?.trim_start();
+    let q = rest.chars().next().filter(|c| *c == '"' || *c == '\'')?;
+    Some(&rest[1..1 + rest[1..].find(q)?])
 }
 
 fn html_to_text(html: &str) -> String {
@@ -641,5 +740,41 @@ mod tests {
         assert!(migrate_library_in(&books).is_empty());
         assert!(migrate_library_in(&books).is_empty());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn imports_epub2_guide_fixture() {
+        let (b, _) = super::import_epub(std::path::Path::new("tests/fixtures/epub2-guide.epub"), "x").unwrap();
+        assert_eq!(b.title, "The Tide Clock");
+        assert_eq!(b.author, "Adela Marsh");
+        let titles: Vec<&str> = b.chapters.iter().map(|c| c.title.as_str()).collect();
+        assert_eq!(titles, ["Cover", "Title Page", "Contents", "Chapter One", "Chapter Two"]);
+        // guide reference types mapped onto the marker vocabulary; Chapter Two starts
+        // mid-file where no guide entry points, so it carries no marker
+        let markers: Vec<Option<&str>> = b.chapters.iter().map(|c| c.marker.as_deref()).collect();
+        assert_eq!(markers, [Some("cover"), Some("titlepage"), Some("toc"), Some("bodymatter"), None]);
+        // the anchor split: each side of the shared file lands in its own chapter
+        let one = b.chapter_text(3);
+        assert!(one.contains("Maren inherited the clock"));
+        assert!(!one.contains("winter visitor"));
+        let two = b.chapter_text(4);
+        assert!(two.contains("winter visitor"));
+        assert!(!two.contains("Maren inherited the clock"));
+        // text before the first anchor of the shared file continues the previous chapter
+        assert!(b.chapter_text(2).contains("The harbour keeps its own hours"));
+    }
+
+    #[test]
+    fn imports_epub3_landmarks_fixture() {
+        let (b, _) = super::import_epub(std::path::Path::new("tests/fixtures/epub3-landmarks.epub"), "x").unwrap();
+        assert_eq!(b.title, "Signal Hill");
+        let titles: Vec<&str> = b.chapters.iter().map(|c| c.title.as_str()).collect();
+        assert_eq!(titles, ["Cover", "Dedication", "First Part", "Sidebar Notes"]);
+        // cover and bodymatter from the landmarks nav, dedication from epub:type on the
+        // body, the non-linear spine item from its linear="no"
+        let markers: Vec<Option<&str>> = b.chapters.iter().map(|c| c.marker.as_deref()).collect();
+        assert_eq!(markers, [Some("cover"), Some("dedication"), Some("bodymatter"), Some("nonlinear")]);
+        assert!(b.chapter_text(2).contains("blinked in threes"));
+        assert!(b.chapter_text(3).contains("how many lamps"));
     }
 }
