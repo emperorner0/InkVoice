@@ -114,6 +114,76 @@ pub fn migrate_legacy() {
 pub fn books_dir() -> PathBuf {
     data_dir().join("books")
 }
+
+// ---------------- ids and folder names ----------------
+
+/// 64-bit FNV-1a hash, written out so ids stay the same across Rust versions
+/// (`DefaultHasher` promises no such thing).
+pub fn fnv64a(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// `s` reduced to lowercase ASCII letters, digits and single underscores. Also the slug for
+/// book folder names: non-alphanumerics collapse to `_`, runs fold together, ends trimmed.
+pub fn ascii_slug(s: &str) -> String {
+    let mut out = String::new();
+    let mut was_us = false;
+    for c in deunicode::deunicode(s).chars() {
+        let c = c.to_ascii_lowercase();
+        if c.is_ascii_alphanumeric() {
+            out.push(c);
+            was_us = false;
+        } else if !was_us && !out.is_empty() {
+            out.push('_');
+            was_us = true;
+        }
+    }
+    while out.ends_with('_') {
+        out.pop();
+    }
+    out
+}
+
+/// The id scheme before short folder names: the imported file's stem, lowercased, with every
+/// non-alphanumeric character replaced by `_`. Both import and migration hash this same string,
+/// so a book imported fresh and one migrated from an old folder land on the same id.
+pub fn legacy_id(stem: &str) -> String {
+    stem.chars().map(|c| if c.is_alphanumeric() { c } else { '_' }).collect::<String>().to_lowercase()
+}
+
+/// Whether an id is already in the `<slug>-<8 hex>` form: a slug of at most 40 characters
+/// from `a-z 0-9 _`, a hyphen, exactly 8 lowercase hex digits. Never decided by hashing, so
+/// migration cannot repeat on a later start.
+pub fn is_new_id(id: &str) -> bool {
+    let Some((slug, hex)) = id.split_once('-') else { return false };
+    !slug.is_empty()
+        && slug.len() <= 40
+        && slug.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        && hex.len() == 8
+        && hex.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
+/// A book's folder name: `<slug>-<8 hex>` with the slug from the title (or the legacy id when
+/// there is no title), at most 40 characters, and the hex digits from the FNV-1a hash of the
+/// legacy id, so the same file always maps to the same short id.
+pub fn book_id(title: &str, legacy: &str) -> String {
+    let mut slug = {
+        let s = ascii_slug(title);
+        (!s.is_empty()).then_some(s).unwrap_or_else(|| ascii_slug(legacy))
+    };
+    slug.truncate(40); // ascii_slug is pure ASCII
+    while slug.ends_with('_') {
+        slug.pop();
+    }
+    let slug = if slug.is_empty() { "book".to_string() } else { slug };
+    format!("{slug}-{:08x}", fnv64a(legacy) as u32)
+}
+
 impl Book {
     pub fn dir(&self) -> PathBuf {
         books_dir().join(&self.id)
@@ -165,19 +235,75 @@ impl Book {
 }
 
 pub fn load_library() -> Vec<Book> {
-    let mut v: Vec<Book> = std::fs::read_dir(books_dir())
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|e| std::fs::read(e.path().join("book.json")).ok())
-        .filter_map(|b| serde_json::from_slice::<Book>(&b).ok())
-        .map(|mut b| {
-            b.load_progress();
-            b
-        })
-        .collect();
+    let mut v: Vec<Book> = Vec::new();
+    let Ok(rd) = std::fs::read_dir(books_dir()) else { return v };
+    for e in rd.flatten() {
+        let Ok(bytes) = std::fs::read(e.path().join("book.json")) else { continue };
+        let Ok(mut b) = serde_json::from_slice::<Book>(&bytes) else { continue };
+        // the folder name is the truth: a half-finished move must not leave a book pointing
+        // at a folder that does not exist
+        if let Some(name) = e.file_name().to_str() {
+            if b.id != name {
+                b.id = name.to_string();
+                let _ = b.save();
+            }
+        }
+        // classify anything imported before sections had kinds, and keep the result
+        if crate::sections::classify(&mut b) {
+            let _ = b.save();
+        }
+        b.load_progress();
+        v.push(b);
+    }
     sort_library(&mut v);
     v
+}
+
+/// One-time move to short book folder names: every book whose id still has the old form has
+/// its folder renamed and its id rewritten; ids already in the new form are never touched
+/// again. When the target exists, or any step fails, the book is left exactly as it was.
+/// Returns the renames done as (from, to) folder names.
+pub fn migrate_library() -> Vec<(String, String)> {
+    migrate_library_in(&books_dir())
+}
+
+fn migrate_library_in(books: &Path) -> Vec<(String, String)> {
+    let mut done = Vec::new();
+    let Ok(rd) = std::fs::read_dir(books) else { return done };
+    for e in rd.flatten() {
+        let dir = e.path();
+        let Ok(bytes) = std::fs::read(dir.join("book.json")) else { continue };
+        let Ok(mut b) = serde_json::from_slice::<Book>(&bytes) else { continue };
+        if is_new_id(&b.id) {
+            continue; // already migrated; hashing the new id would drift on every start
+        }
+        // the stored old id is the legacy id the import once made from the file stem, so a
+        // fresh import of the same file lands on the same new id
+        b.id = book_id(&b.title, &b.id);
+        let Ok(new_bytes) = serde_json::to_vec(&b) else { continue };
+        let Some(from) = dir.file_name().and_then(|n| n.to_str()).map(String::from) else { continue };
+        let to = books.join(&b.id);
+        if to.exists() {
+            continue; // never overwrite
+        }
+        // crash-safe: the updated book.json sits inside the folder before it moves, and takes
+        // the old file's place after; a failure at any step restores what was
+        let tmp = dir.join("book.json.new");
+        if std::fs::write(&tmp, &new_bytes).is_err() {
+            continue;
+        }
+        if std::fs::rename(&dir, &to).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            continue;
+        }
+        if std::fs::rename(to.join("book.json.new"), to.join("book.json")).is_err() {
+            let _ = std::fs::rename(&to, &dir);
+            let _ = std::fs::remove_file(dir.join("book.json.new"));
+            continue;
+        }
+        done.push((from, b.id.clone()));
+    }
+    done
 }
 
 /// Most recently opened first, then by title.
@@ -194,14 +320,11 @@ pub fn import(path: &Path) -> Result<Book> {
         _ => bail!("Unsupported file type (use .epub or .pdf)"),
     };
     book.source = path.to_string_lossy().into_owned();
-    book.id = stem
-        .chars()
-        .map(|c| if c.is_alphanumeric() { c } else { '_' })
-        .collect::<String>()
-        .to_lowercase();
+    book.id = book_id(&book.title, &legacy_id(&stem));
     if book.chapters.is_empty() {
         bail!("No readable text found (scanned PDF?)");
     }
+    crate::sections::classify(&mut book);
     book.save()?;
     if let Some(bytes) = cover {
         // store a small thumbnail; a missing/odd cover is not an import error
@@ -435,5 +558,88 @@ mod tests {
         assert!(b.chapters[0].pages.len() > 1);
         assert!(b.chapters[0].pages.iter().all(|p| p.chars().count() <= 2000));
         println!("{}", b.chapters[0].pages[0]);
+    }
+
+    #[test]
+    fn ids_are_short_and_stable() {
+        use super::{ascii_slug, book_id, fnv64a, is_new_id, legacy_id};
+        // FNV-1a 64-bit, pinned: the hash written out, not DefaultHasher
+        assert_eq!(fnv64a("the_salt_road"), 0x2742_642c_4525_57ac);
+        assert_eq!(legacy_id("Quiet Harbor - A. B. Carter"), "quiet_harbor___a__b__carter");
+        // a fresh import and an old library migrate to the same id
+        let stem = "The Ellis Family History - scanned 1911 copy";
+        let old = legacy_id(stem);
+        assert_eq!(book_id("The Ellis Family History", &old), "the_ellis_family_history-fbf52b90");
+        assert_eq!(book_id("Quiet Harbor", &legacy_id("Quiet Harbor - A. B. Carter")), "quiet_harbor-9f6689e3");
+        assert_eq!(book_id("", &legacy_id("A Long Way From Home")), "a_long_way_from_home-94f15b0e");
+        let long = book_id(
+            "The Complete and Utter History of Almost Everything Worth Mentioning",
+            &legacy_id("The Complete and Utter History of Almost Everything Worth Mentioning"),
+        );
+        assert_eq!(long, "the_complete_and_utter_history_of_almost-9805916d");
+        assert_eq!(long.len(), 49); // 40 slug + hyphen + 8 hex
+        assert!(is_new_id(&long) && is_new_id("a-00000000") && !is_new_id("quiet_harbor___a__b__carter_"));
+        assert!(!is_new_id("quiet-123456789")); // nine hex digits
+        assert!(!is_new_id("Quiet_Harbor-9f6689e3")); // capitals are not the written form
+        assert_eq!(ascii_slug("  Salt  &  Ember Fire "), "salt_ember_fire");
+    }
+
+    /// A library tree built in a scratch folder: an old long-id book, a book already in the
+    /// new form, and one whose target name is taken. Migration renames the first once,
+    /// leaves the others alone, and a second run does nothing.
+    #[test]
+    fn migrates_book_folders() {
+        use super::{book_id, is_new_id, legacy_id, migrate_library_in, Book, Chapter};
+        let root = std::env::temp_dir().join("inkvoice-test-migrate-folders");
+        let _ = std::fs::remove_dir_all(&root);
+        let books = root.join("books");
+        let mk = |id: &str, title: &str| {
+            let dir = books.join(id);
+            std::fs::create_dir_all(dir.join("audio/phonon-everly")).unwrap();
+            let b = Book {
+                id: id.into(),
+                title: title.into(),
+                author: String::new(),
+                source: String::new(),
+                chapters: vec![Chapter::new("One".into(), vec!["text one".into(), "text two".into()])],
+                pos: (0, 0),
+                opened: 0,
+                listen: None,
+            };
+            std::fs::write(dir.join("book.json"), serde_json::to_vec(&b).unwrap()).unwrap();
+            std::fs::write(dir.join("progress.json"), r#"{"ch":0,"pg":1,"opened":9}"#).unwrap();
+            std::fs::write(dir.join("audio/phonon-everly/c0000.wav"), b"wav").unwrap();
+        };
+        let stem = "the_ellis_family_history_and_their_many_relations_in_the_north_1902_second_edition";
+        mk(stem, "The Ellis Family History"); // an old long id
+        let settled = book_id("Winter Cars", "winter_cars");
+        mk(&settled, "Winter Cars"); // already migrated
+        mk("tide_charts", "Tide Charts");
+        // the target folder for "tide_charts" is taken by a book with the same title
+        mk(&book_id("Tide Charts", "tide_charts"), "Tide Charts");
+
+        let done = migrate_library_in(&books);
+        assert_eq!(done.len(), 1);
+        let want = book_id("The Ellis Family History", stem);
+        assert_eq!(done[0], (stem.to_string(), want.clone()));
+        assert!(books.join(&want).is_dir(), "folder renamed");
+        assert!(!books.join(stem).exists(), "old folder gone");
+        let moved: Book = serde_json::from_slice(&std::fs::read(books.join(&want).join("book.json")).unwrap()).unwrap();
+        assert_eq!(moved.id, want);
+        assert!(is_new_id(&moved.id));
+        assert_eq!(std::fs::read_to_string(books.join(&want).join("progress.json")).unwrap(), r#"{"ch":0,"pg":1,"opened":9}"#);
+        assert!(books.join(&want).join("audio/phonon-everly/c0000.wav").exists(), "audio came along");
+        // the taken target and the settled book are untouched
+        assert!(books.join("tide_charts").is_dir());
+        assert!(books.join(&book_id("Tide Charts", "tide_charts")).is_dir());
+        assert!(books.join(&settled).is_dir());
+        // a fresh import of the same file lands on the same id as the migrated book
+        let stem_words = "The Ellis Family History and their many relations in the north 1902 second edition";
+        assert_eq!(book_id("The Ellis Family History", &legacy_id(stem_words)), want);
+
+        // the second run renames nothing
+        assert!(migrate_library_in(&books).is_empty());
+        assert!(migrate_library_in(&books).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

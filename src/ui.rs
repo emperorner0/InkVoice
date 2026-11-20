@@ -117,6 +117,8 @@ enum Act {
     CancelRemove,
     Remove(String),
     GoChapter(usize),
+    /// set this section's own skip-when-listening choice
+    SetSkip(usize, bool),
     GenerateAll,
     Regenerate(usize),
     /// speak this spoken form once ("hear it")
@@ -147,6 +149,14 @@ impl App {
             Some(Act::Remove(id)) => self.remove_book(&id),
             Some(Act::GoChapter(i)) => self.go(i, 0),
             Some(Act::GenerateAll) => self.generate_all(),
+            Some(Act::SetSkip(i, skip)) => {
+                if let Some(b) = self.open_book_mut() {
+                    if let Some(c) = b.chapters.get_mut(i) {
+                        c.skip = Some(skip);
+                        let _ = b.save();
+                    }
+                }
+            }
             Some(Act::Regenerate(ch)) => self.regenerate_chapter(ch),
             Some(Act::HearForm(say)) => self.hear_form(&say),
             Some(Act::PronSet(row, say)) => {
@@ -503,8 +513,9 @@ impl App {
     fn details_panel(&mut self, ctx: &egui::Context) {
         let Some(id) = self.sel.clone() else { return };
         let Some(b) = self.book(&id) else { return };
-        let (title, author, chapters, pages, frac, opened) =
-            (b.title.clone(), b.author.clone(), b.chapters.len(), b.page_count(), b.read_fraction(), b.opened);
+        // counts leave out sections that are skipped when listening
+        let (chapters, pages) = b.chapters.iter().filter(|c| !c.skipped()).fold((0, 0), |(n, p), c| (n + 1, p + c.pages.len()));
+        let (title, author, frac, opened) = (b.title.clone(), b.author.clone(), b.read_fraction(), b.opened);
         let at = b.chapters.get(b.pos.0).map(|c| format!("{} · page {}", c.title, b.pos.1 + 1)).unwrap_or_default();
         let started = b.pos != (0, 0);
         let mut act = None;
@@ -599,7 +610,12 @@ impl App {
 
     fn contents_panel(&mut self, ctx: &egui::Context) {
         let Some(b) = self.open_book() else { return };
-        let chapters: Vec<(String, usize)> = b.chapters.iter().map(|c| (c.title.clone(), c.pages.len())).collect();
+        let chapters: Vec<(String, usize, bool, &'static str)> = b
+            .chapters
+            .iter()
+            .map(|c| (c.title.clone(), c.pages.len(), c.skipped(), c.kind.map(|k| k.label()).unwrap_or("Section")))
+            .collect();
+        let kept = chapters.iter().filter(|c| !c.2).count();
         let book_id = b.id.clone();
         let page_mode = self.cfg.page_mode;
         let (now_unit, playing) = self
@@ -616,14 +632,14 @@ impl App {
             .width_range(220.0..=440.0)
             .frame(Frame::side_top_panel(&ctx.style()).inner_margin(Margin::symmetric(12, 14)))
             .show(ctx, |ui| {
-                ui.label(RichText::new(format!("CONTENTS  ·  {} chapters", chapters.len())).small().strong().color(DIM));
+                ui.label(RichText::new(format!("CONTENTS  ·  {kept} chapters")).small().strong().color(DIM));
                 ui.add_space(6.0);
                 let footer_h = 70.0;
                 egui::ScrollArea::vertical()
                     .max_height(ui.available_height() - footer_h)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        for (i, (title, pages)) in chapters.iter().enumerate() {
+                        for (i, (title, pages, skipped, kind)) in chapters.iter().enumerate() {
                             let current = self.ch == i;
                             ui.horizontal(|ui| {
                                 ui.allocate_ui_with_layout(Vec2::new(40.0, 24.0), Layout::centered_and_justified(egui::Direction::LeftToRight), |ui| {
@@ -631,10 +647,10 @@ impl App {
                                         let n = (0..*pages)
                                             .filter(|&p| {
                                                 let path = self.book(&book_id).map(|b| self.audio_path(b, i, Some(p)));
-                                                path.is_some_and(|p| self.have.contains(&p))
+                                                path.is_some_and(|p| self.is_ready(&p))
                                             })
                                             .count();
-                                        if n == *pages {
+                                        if n == *pages && !skipped {
                                             ready_total += 1;
                                         }
                                         let (t, c) = if n == *pages { ("✔".to_string(), ACCENT) } else if n > 0 { (format!("{n}/{pages}"), DIM) } else { (String::new(), FAINT) };
@@ -648,8 +664,10 @@ impl App {
                                         ui.label(RichText::new(format!("{:.0}%", prog * 100.0)).small().color(ACCENT)).on_hover_text("Generating…");
                                     } else if self.pending.contains_key(&path) {
                                         ui.label(RichText::new("⏳").color(FAINT)).on_hover_text("Queued");
-                                    } else if self.have.contains(&path) {
-                                        ready_total += 1;
+                                    } else if self.is_ready(&path) {
+                                        if !skipped {
+                                            ready_total += 1;
+                                        }
                                         let is_now = now_unit.as_ref() == Some(&unit);
                                         let glyph = if is_now && playing { "⏸" } else { "⏵" };
                                         let r = ui.add(Button::new(RichText::new(glyph).color(ACCENT)).frame(false));
@@ -664,12 +682,19 @@ impl App {
                                     }
                                 });
                                 ui.style_mut().wrap_mode = Some(TextWrapMode::Truncate);
-                                let text = RichText::new(title).color(if current { ACCENT } else { TEXT });
+                                let text = RichText::new(title).color(if current { ACCENT } else if *skipped { DIM } else { TEXT });
                                 let r = ui.selectable_label(current, text);
+                                if *skipped {
+                                    ui.label(RichText::new(format!("· {kind}")).small().color(FAINT));
+                                }
                                 if r.clicked() {
                                     act = Some(Act::GoChapter(i));
                                 }
                                 r.context_menu(|ui| {
+                                    if ui.button(if *skipped { "Include when listening" } else { "Skip when listening" }).clicked() {
+                                        act = Some(Act::SetSkip(i, !*skipped));
+                                        ui.close_menu();
+                                    }
                                     if ui.button("⟳  Regenerate audio").on_hover_text("Delete this chapter's audio for the current voice and make it again with the current settings").clicked() {
                                         act = Some(Act::Regenerate(i));
                                         ui.close_menu();
@@ -680,7 +705,7 @@ impl App {
                     });
                 ui.separator();
                 let unit_word = if page_mode { "chapters complete" } else { "chapters ready" };
-                ui.label(RichText::new(format!("{ready_total} / {} {unit_word} · {}", chapters.len(), config::profile_label(&self.cfg.profile()))).small().color(DIM));
+                ui.label(RichText::new(format!("{ready_total} / {kept} {unit_word} · {}", config::profile_label(&self.cfg.profile()))).small().color(DIM));
                 let w = ui.available_width();
                 if ui.add_sized([w, 30.0], Button::new("🎧  Generate whole book")).on_hover_text("Queue audio for every chapter (or page, in page mode)").clicked() {
                     act = Some(Act::GenerateAll);
@@ -697,6 +722,13 @@ impl App {
         let page = chapter.pages[pg].clone();
         let ch_title = chapter.title.clone();
         let (n_pages, n_ch) = (chapter.pages.len(), b.chapters.len());
+        // listening counts and numbers leave out skipped sections; a skipped section shows
+        // its kind where the chapter number would be
+        let kept: Vec<usize> = b.chapters.iter().enumerate().filter(|(_, c)| !c.skipped()).map(|(i, _)| i).collect();
+        let place = kept.iter().position(|&i| i == ch).map_or_else(
+            || chapter.kind.map(|k| k.label()).unwrap_or("Section").to_string(),
+            |p| format!("Chapter {} of {}", p + 1, kept.len()),
+        );
         let page_start = b.page_char_starts(ch)[pg];
         let book_id = b.id.clone();
 
@@ -819,7 +851,7 @@ impl App {
                                 nav = 1;
                             }
                             ui.with_layout(Layout::centered_and_justified(egui::Direction::LeftToRight), |ui| {
-                                ui.label(RichText::new(format!("Page {} of {}  ·  Chapter {} of {}", pg + 1, n_pages, ch + 1, n_ch)).small().color(DIM));
+                                ui.label(RichText::new(format!("Page {} of {}  ·  {place}", pg + 1, n_pages)).small().color(DIM));
                             });
                         });
                     });

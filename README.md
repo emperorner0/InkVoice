@@ -54,6 +54,12 @@ This repository is a fork of [sabeel111/InkVoice](https://github.com/sabeel111/I
   common abbreviations aloud correctly, with no server needed; an optional language model behind any
   OpenAI-compatible server settles ambiguous words like a past-tense "read". It works with every
   engine. See [docs/normalization.md](docs/normalization.md).
+- Sections recognised as front or back matter (title pages, contents, praise, "also by", about-the-author,
+  notes and the like) are left out of listening, generating and the chapter numbering, each one overridable
+  from its context menu in the contents list. See [docs/sections-and-files.md](docs/sections-and-files.md).
+- Short book folder names (`<title-slug>-<8 hex>`) and readable audio file names
+  (`03_The_Quiet_Harbor_c0003.wav`), moved over once at start-up; audio lookups go by the chapter key, so
+  old names and title changes never orphan a file.
 
 ## Install
 

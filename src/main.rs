@@ -126,12 +126,14 @@ pub struct App {
     import_tx: Sender<Result<Book, String>>,
     importing: bool,
     player: Option<Player>,
+    /// ready wav files of the open book for the current voice profile
+    have: HashSet<PathBuf>,
+    /// their unit keys, so a unit is found whatever name form its file is in
+    have_keys: HashMap<(usize, Option<usize>), PathBuf>,
+    lib_audio: HashMap<String, Vec<AudioItem>>,
     status: Option<Status>,
     ctx: egui::Context,
     scroll_top: bool,
-    /// ready wav files of the open book for the current voice profile
-    have: HashSet<PathBuf>,
-    lib_audio: HashMap<String, Vec<AudioItem>>,
     confirm_remove: Option<String>,
     covers: HashMap<String, Option<egui::TextureHandle>>,
     search: String,
@@ -176,7 +178,7 @@ impl App {
         let (import_tx, import_rx) = channel();
         let tts = tts::Tts::start(cfg.worker_command(), cfg.normalize_key(), cc.egui_ctx.clone());
         let mut app = Self {
-            lib: book::load_library(),
+            lib: migrate_startup(),
             open: None,
             sel: None,
             ch: 0,
@@ -194,6 +196,7 @@ impl App {
             ctx: cc.egui_ctx.clone(),
             scroll_top: false,
             have: HashSet::new(),
+            have_keys: HashMap::new(),
             lib_audio: HashMap::new(),
             confirm_remove: None,
             covers: HashMap::new(),
@@ -263,11 +266,7 @@ impl App {
     }
 
     fn audio_path(&self, b: &Book, ch: usize, pg: Option<usize>) -> PathBuf {
-        let name = match pg {
-            None => format!("c{ch:04}.wav"),
-            Some(p) => format!("c{ch:04}_p{p:04}.wav"),
-        };
-        b.dir().join("audio").join(self.cfg.profile()).join(name)
+        b.dir().join("audio").join(self.cfg.profile()).join(unit_stem(b, ch, pg)).with_extension("wav")
     }
     fn unit_path(&self, u: &Unit) -> Option<PathBuf> {
         Some(self.audio_path(self.book(&u.book)?, u.ch, u.pg))
@@ -292,33 +291,21 @@ impl App {
         Some(Unit { book: self.open.clone()?, ch: self.ch, pg: self.cfg.page_mode.then_some(self.pg) })
     }
     fn next_unit(&self, u: &Unit) -> Option<Unit> {
-        let b = self.book(&u.book)?;
-        let mut n = u.clone();
-        match u.pg {
-            None => n.ch += 1,
-            Some(p) if p + 1 < b.chapters[u.ch].pages.len() => n.pg = Some(p + 1),
-            Some(_) => {
-                n.ch += 1;
-                n.pg = Some(0);
-            }
-        }
-        (n.ch < b.chapters.len()).then_some(n)
+        self.book(&u.book).and_then(|b| step_unit(b, u, true))
     }
     fn prev_unit(&self, u: &Unit) -> Option<Unit> {
-        let b = self.book(&u.book)?;
-        let mut n = u.clone();
-        match u.pg {
-            None => n.ch = u.ch.checked_sub(1)?,
-            Some(p) if p > 0 => n.pg = Some(p - 1),
-            Some(_) => {
-                n.ch = u.ch.checked_sub(1)?;
-                n.pg = Some(b.chapters[n.ch].pages.len() - 1);
-            }
+        self.book(&u.book).and_then(|b| step_unit(b, u, false))
+    }
+    /// The audio file that exists for this unit's key, whichever name form it is in.
+    fn existing_audio(&self, path: &Path) -> Option<PathBuf> {
+        if self.have.contains(path) || path.exists() {
+            return Some(path.to_path_buf());
         }
-        Some(n)
+        let key = path.file_stem()?.to_str().and_then(parse_unit_name)?;
+        self.have_keys.get(&key).cloned()
     }
     fn is_ready(&self, path: &Path) -> bool {
-        self.have.contains(path) || path.exists()
+        self.existing_audio(path).is_some()
     }
 
     // ---------- status ----------
@@ -334,10 +321,18 @@ impl App {
 
     fn refresh_have(&mut self) {
         self.have.clear();
+        self.have_keys.clear();
         let Some(b) = self.open_book() else { return };
         let dir = b.dir().join("audio").join(self.cfg.profile());
         if let Ok(rd) = std::fs::read_dir(dir) {
-            self.have = rd.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e == "wav")).collect();
+            let mut paths: Vec<PathBuf> = rd.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e == "wav")).collect();
+            paths.sort(); // the readable name form sorts before the old bare "c..." form
+            for p in paths {
+                if let Some(k) = p.file_stem().and_then(|s| s.to_str()).and_then(parse_unit_name) {
+                    self.have_keys.entry(k).or_insert_with(|| p.clone());
+                }
+                self.have.insert(p);
+            }
         }
     }
 
@@ -477,9 +472,16 @@ impl App {
         }
         let Some(b) = self.open_book() else { return };
         let id = b.id.clone();
-        let shape: Vec<usize> = b.chapters.iter().map(|c| c.pages.len()).collect();
+        // sections left out of listening are not generated either
+        let shape: Vec<(usize, usize)> = b
+            .chapters
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| !c.skipped())
+            .map(|(i, c)| (i, c.pages.len()))
+            .collect();
         let mut n = 0;
-        for (ch, pages) in shape.into_iter().enumerate() {
+        for (ch, pages) in shape.into_iter() {
             let units: Vec<Option<usize>> = if self.cfg.page_mode { (0..pages).map(Some).collect() } else { vec![None] };
             for pg in units {
                 let u = Unit { book: id.clone(), ch, pg };
@@ -524,16 +526,22 @@ impl App {
             if self.pending.contains_key(&path) {
                 continue; // already being made
             }
-            if self.player.as_ref().and_then(|p| p.now.as_ref()).is_some_and(|n| n.path == path) {
+            if self.player.as_ref().and_then(|p| p.now.as_ref()).is_some_and(|n| n.unit == *u) {
                 if let Some(p) = &mut self.player {
                     p.stop();
                 }
             }
-            let _ = std::fs::remove_file(&path);
-            let _ = std::fs::remove_file(player::timing_path(&path));
+            // delete the unit's files in whatever name form they are in
+            if let Some(dir) = path.parent() {
+                remove_unit_files(dir, ch, u.pg);
+            }
             self.have.remove(&path);
+            if let Some(k) = path.file_stem().and_then(|s| s.to_str()).and_then(parse_unit_name) {
+                self.have_keys.remove(&k);
+            }
             self.enqueue(u);
         }
+        self.refresh_have();
         let title = self.unit_label(&Unit { book: id.clone(), ch, pg: None });
         if let Some(b) = self.book(&id) {
             let items = scan_audio(b);
@@ -701,8 +709,8 @@ impl App {
     /// Play a unit from the word at `start_char` (chars into the unit's text).
     fn play_from_char(&mut self, u: Unit, start_char: Option<usize>) {
         let Some(path) = self.unit_path(&u) else { return };
-        if self.is_ready(&path) {
-            self.play_path(&path, u, start_char);
+        if let Some(file) = self.existing_audio(&path) {
+            self.play_path(&file, u, start_char);
         } else if self.engine_ready() {
             if let Some(p) = &mut self.player {
                 p.stop();
@@ -727,7 +735,11 @@ impl App {
                 self.follow_target = None;
                 self.last_word = None;
                 // prepare the next chapter/page while this one plays (current voice only)
-                if self.cfg.prefetch && self.unit_path(&u).as_deref() == Some(path) {
+                let same_unit_file = |a: &Path, b: &Path| {
+                    let key = |p: &Path| p.parent().map(Path::to_path_buf).zip(p.file_stem().and_then(|s| s.to_str()).and_then(parse_unit_name));
+                    key(a).is_some_and(|k| key(b) == Some(k))
+                };
+                if self.cfg.prefetch && self.unit_path(&u).as_deref().is_some_and(|p| same_unit_file(p, path)) {
                     if let Some(n) = self.next_unit(&u) {
                         self.enqueue(&n);
                     }
@@ -1043,6 +1055,9 @@ impl App {
                         self.job = None;
                     }
                     self.have.insert(p.clone());
+                    if let Some(k) = p.file_stem().and_then(|s| s.to_str()).and_then(parse_unit_name) {
+                        self.have_keys.insert(k, p.clone());
+                    }
                     if let Some(id) = book_id_of(&p) {
                         changed_books.insert(id);
                     }
@@ -1220,16 +1235,196 @@ fn say_hash(say: &str) -> String {
 }
 
 fn parse_unit_name(stem: &str) -> Option<(usize, Option<usize>)> {
-    let rest = stem.strip_prefix('c')?;
-    Some(match rest.split_once("_p") {
-        Some((c, p)) => (c.parse().ok()?, Some(p.parse().ok()?)),
-        None => (rest.parse().ok()?, None),
-    })
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let key = |k: &str| -> Option<(usize, Option<usize>)> {
+        Some(match k.split_once("_p") {
+            Some((c, p)) if digits(c) && digits(p) => (c.parse().ok()?, Some(p.parse().ok()?)),
+            None if digits(k) => (k.parse().ok()?, None),
+            _ => return None,
+        })
+    };
+    // the old bare form "c0006" starts with the key; the readable form "07_Title_c0006"
+    // carries it at the end, after the last "_c"
+    if let Some(u) = stem.strip_prefix('c').and_then(key) {
+        return Some(u);
+    }
+    let (_, k) = stem.rsplit_once("_c")?;
+    key(k)
+}
+
+/// Slug of a section title for audio file names: "Quiet Harbor - A. B. Carter" ->
+/// "Quiet_Harbor_ABCarter", "Chapter 5" -> "Chapter_5"; words joined by "_", the author part
+/// of a "Title - Author" title compacted to its letters and digits; ASCII letters, digits and
+/// "_" only, at most 60 characters, empty when nothing is left.
+fn title_slug(title: &str) -> String {
+    let words = |s: &str| {
+        s.split_whitespace()
+            .map(|w| w.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>())
+            .filter(|w| !w.is_empty())
+            .collect::<Vec<_>>()
+            .join("_")
+    };
+    let ascii = deunicode::deunicode(title);
+    let mut slug = match ascii.split_once(" - ") {
+        Some((head, by)) if !by.trim().is_empty() => {
+            let author: String = by.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+            format!("{}_{}", words(head), author)
+        }
+        _ => words(&ascii),
+    };
+    slug.truncate(60);
+    while slug.starts_with('_') {
+        slug.remove(0);
+    }
+    while slug.ends_with('_') {
+        slug.pop();
+    }
+    slug
+}
+
+/// Audio file stem of a unit: "06_Quiet_Harbor_c0006", page mode "06_Quiet_Harbor_c0006_p0003".
+/// The section number takes two digits, three in a book with 100 or more sections, and the
+/// chapter key ends the name so a later title change never orphans the lookup.
+fn unit_stem(b: &Book, ch: usize, pg: Option<usize>) -> String {
+    let w = if b.chapters.len() >= 100 { 3 } else { 2 };
+    let key = match pg {
+        None => format!("c{ch:04}"),
+        Some(p) => format!("c{ch:04}_p{p:04}"),
+    };
+    let slug = b.chapters.get(ch).map(|c| title_slug(&c.title)).unwrap_or_default();
+    if slug.is_empty() {
+        format!("{:0w$}_{key}", ch, w = w)
+    } else {
+        format!("{:0w$}_{slug}_{key}", ch, w = w)
+    }
+}
+
+/// Delete every audio (and timing) file for one unit key in a voice folder, any name form.
+fn remove_unit_files(dir: &Path, ch: usize, pg: Option<usize>) {
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for p in rd.flatten().map(|e| e.path()) {
+            let same = p.file_stem().and_then(|s| s.to_str()).and_then(parse_unit_name) == Some((ch, pg));
+            if same && p.extension().is_some_and(|e| e == "wav") {
+                let _ = std::fs::remove_file(&p);
+                let _ = std::fs::remove_file(player::timing_path(&p));
+            }
+        }
+    }
+}
+
+/// One voice folder's worth of the one-time audio renaming.
+pub struct AudioMove {
+    /// index into the library the migration ran on (ids are title-derived; keep them out of logs)
+    pub book: usize,
+    pub profile: String,
+    pub renamed: usize,
+    /// old-form files that could not be renamed and stayed
+    pub left: usize,
+}
+
+/// One-time move to readable audio file names: in every voice folder of every book, rename
+/// old bare-key files ("c0006.wav" plus its ".json") to the readable "06_Title_c0006.wav" form, and
+/// remove leftover "*.stream.pcm" files of interrupted streams. A file whose target exists,
+/// or that cannot be renamed, is left as it is; nothing else is touched, and a second run
+/// finds nothing to do.
+pub fn migrate_audio_names(lib: &[Book]) -> Vec<AudioMove> {
+    migrate_audio_in(lib, &book::books_dir())
+}
+
+fn migrate_audio_in(lib: &[Book], books: &Path) -> Vec<AudioMove> {
+    let mut out = Vec::new();
+    for (bi, b) in lib.iter().enumerate() {
+        let Ok(profiles) = std::fs::read_dir(books.join(&b.id).join("audio")) else { continue };
+        for dir in profiles.flatten().map(|e| e.path()).filter(|p| p.is_dir()) {
+            let profile = dir.file_name().unwrap_or_default().to_string_lossy().into_owned();
+            let (mut renamed, mut left) = (0, 0);
+            let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+            for e in rd.flatten() {
+                let p = e.path();
+                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if name.ends_with(".stream.pcm") {
+                    let _ = std::fs::remove_file(&p);
+                    continue;
+                }
+                let Some(stem) = p.file_stem().and_then(|s| s.to_str()) else { continue };
+                if !stem.starts_with('c') || p.extension().is_some_and(|e| e != "wav") {
+                    continue; // new-form name, or not audio
+                }
+                let Some((ch, pg)) = parse_unit_name(stem) else { continue };
+                if b.chapters.get(ch).is_none() {
+                    left += 1; // audio without its section; leave it
+                    continue;
+                }
+                let want = dir.join(unit_stem(b, ch, pg)).with_extension("wav");
+                if want == p || want.exists() {
+                    left += 1; // never rename onto an existing file
+                    continue;
+                }
+                // the timing json moves with its wav, or not at all: it goes first, and
+                // comes back if the wav cannot follow
+                let json = p.with_extension("json");
+                let json_to = want.with_extension("json");
+                let paired = !json.exists() || (!json_to.exists() && std::fs::rename(&json, &json_to).is_ok());
+                if !paired {
+                    left += 1;
+                    continue;
+                }
+                if std::fs::rename(&p, &want).is_err() {
+                    if json.exists() {
+                        let _ = std::fs::rename(&json_to, &json);
+                    }
+                    left += 1;
+                    continue;
+                }
+                renamed += 1;
+            }
+            out.push(AudioMove { book: bi, profile, renamed, left });
+        }
+    }
+    out
+}
+
+/// Everything the app fixes once at start-up, before the library is used: short book folder
+/// names, then classification while loading, then readable audio file names.
+fn migrate_startup() -> Vec<Book> {
+    book::migrate_library();
+    let lib = book::load_library();
+    migrate_audio_names(&lib);
+    lib
 }
 
 fn unit_of(p: &Path) -> Option<Unit> {
     let (ch, pg) = parse_unit_name(p.file_stem()?.to_str()?)?;
     Some(Unit { book: book_id_of(p)?, ch, pg })
+}
+
+/// The neighbouring unit, stepping over sections that are left out of listening.
+fn step_unit(b: &Book, u: &Unit, forward: bool) -> Option<Unit> {
+    let mut n = u.clone();
+    loop {
+        if forward {
+            match n.pg {
+                None => n.ch += 1,
+                Some(p) if p + 1 < b.chapters.get(n.ch)?.pages.len() => n.pg = Some(p + 1),
+                Some(_) => {
+                    n.ch += 1;
+                    n.pg = Some(0);
+                }
+            }
+        } else {
+            match n.pg {
+                None => n.ch = n.ch.checked_sub(1)?,
+                Some(p) if p > 0 => n.pg = Some(p - 1),
+                Some(_) => {
+                    n.ch = n.ch.checked_sub(1)?;
+                    n.pg = Some(b.chapters[n.ch].pages.len().saturating_sub(1));
+                }
+            }
+        }
+        if !b.chapters.get(n.ch)?.skipped() {
+            return Some(n);
+        }
+    }
 }
 
 fn scan_audio(b: &Book) -> Vec<AudioItem> {
@@ -1277,6 +1472,7 @@ fn main() -> eframe::Result {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // headless import: `inkvoice --import book.epub`
     if args.first().map(String::as_str) == Some("--import") {
+        book::migrate_library(); // imports land next to the short ids
         for p in &args[1..] {
             match book::import(Path::new(p)) {
                 Ok(b) => println!("imported: {} ({} chapters)", b.title, b.chapters.len()),
@@ -1319,6 +1515,154 @@ mod tests {
         let u = unit_of(Path::new("/x/books/my_book/audio/phonon-everly/c0002_p0001.wav")).unwrap();
         assert_eq!(u, Unit { book: "my_book".into(), ch: 2, pg: Some(1) });
     }
+
+    #[test]
+    fn audio_names_round_trip() {
+        // "Title - Author" titles: the author part compacted; plain titles: words joined
+        assert_eq!(title_slug("Quiet Harbor - A. B. Carter"), "Quiet_Harbor_ABCarter");
+        assert_eq!(title_slug("Chapter 5"), "Chapter_5");
+        assert_eq!(title_slug("  "), "");
+        assert_eq!(title_slug("Salt & Ember"), "Salt_Ember");
+        let mk = |n: usize, title: &str| {
+            let chapters: Vec<book::Chapter> =
+                (0..n).map(|i| book::Chapter::new(if i == 1 { title.into() } else { format!("Section {i}") }, vec!["text".into()])).collect();
+            book::Book { id: "b".into(), title: "T".into(), author: String::new(), source: String::new(), chapters, pos: (0, 0), opened: 0, listen: None }
+        };
+        let b = mk(7, "Quiet Harbor - A. B. Carter");
+        assert_eq!(unit_stem(&b, 1, None), "01_Quiet_Harbor_ABCarter_c0001");
+        assert_eq!(unit_stem(&b, 1, Some(3)), "01_Quiet_Harbor_ABCarter_c0001_p0003");
+        let plain = mk(7, "Chapter 5");
+        assert_eq!(unit_stem(&plain, 1, None), "01_Chapter_5_c0001");
+        // no slug left: the key alone
+        let mute = mk(2, "«»");
+        assert_eq!(unit_stem(&mute, 1, None), "01_c0001");
+        // three digits once the book has 100 or more sections
+        let big = mk(101, "Quiet Harbor");
+        assert_eq!(unit_stem(&big, 100, None), "100_Section_100_c0100");
+        // every name the builder makes parses back to its key, and so do the old bare forms
+        for (b, ch, pg) in [(&b, 1, None), (&b, 1, Some(3)), (&plain, 1, None), (&big, 100, None)] {
+            let stem = unit_stem(b, ch, pg);
+            assert_eq!(parse_unit_name(&stem), Some((ch, pg)), "{stem}");
+        }
+        assert_eq!(parse_unit_name("06_The_Salt_Road_c0006"), Some((6, None)));
+        assert_eq!(parse_unit_name("06_The_Salt_Road_c0006_p0002"), Some((6, Some(2))));
+        assert_eq!(parse_unit_name("06_c0006"), Some((6, None)));
+        assert_eq!(parse_unit_name("06_Title_with_c3_inside_c0006"), Some((6, None)));
+        assert_eq!(parse_unit_name("not_a_unit"), None);
+        assert_eq!(parse_unit_name("01_Title_12_pX"), None);
+    }
+
+    /// Previous/next step over sections left out of listening, in both voice modes.
+    #[test]
+    fn stepping_skips_skipped_sections() {
+        let chapters: Vec<book::Chapter> = (0..=4)
+            .map(|i| book::Chapter::new(format!("Section {i}"), vec![format!("page {i} a"), format!("page {i} b")]))
+            .collect();
+        let b = book::Book {
+            id: "b".into(),
+            title: "T".into(),
+            author: String::new(),
+            source: String::new(),
+            chapters,
+            pos: (0, 0),
+            opened: 0,
+            listen: None,
+        };
+        let mut b = b;
+        b.chapters[1].skip = Some(false); // kept on purpose
+        b.chapters[3].skip = Some(true); // skipped on purpose
+        let u = |ch: usize, pg: Option<usize>| Unit { book: "b".into(), ch, pg };
+        assert_eq!(step_unit(&b, &u(0, None), true), Some(u(1, None)));
+        assert_eq!(step_unit(&b, &u(2, None), true), Some(u(4, None)));
+        assert_eq!(step_unit(&b, &u(4, None), true), None);
+        assert_eq!(step_unit(&b, &u(4, None), false), Some(u(2, None)));
+        assert_eq!(step_unit(&b, &u(0, None), false), None);
+        // page mode crosses skipped chapters whole
+        assert_eq!(step_unit(&b, &u(2, Some(1)), true), Some(u(4, Some(0))));
+        assert_eq!(step_unit(&b, &u(4, Some(0)), false), Some(u(2, Some(1))));
+        assert_eq!(step_unit(&b, &u(2, Some(0)), false), Some(u(1, Some(1))));
+    }
+
+    /// The one-time audio renaming on a scratch tree: old names and their timing jsons move
+    /// together, stream leftovers go, blocked targets stay put, and a second run does nothing.
+    #[test]
+    fn migrates_audio_file_names() {
+        let root = std::env::temp_dir().join("inkvoice-test-migrate-audio");
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("books/quiet_harbor-9f6689e3/audio/phonon-everly");
+        std::fs::create_dir_all(&dir).unwrap();
+        let b = book::Book {
+            id: "quiet_harbor-9f6689e3".into(),
+            title: "Quiet Harbor".into(),
+            author: String::new(),
+            source: String::new(),
+            chapters: vec![
+                book::Chapter::new("Title Page".into(), vec!["t".into()]),
+                book::Chapter::new("The Quiet Harbor".into(), vec!["a".into()]),
+            ],
+            pos: (0, 0),
+            opened: 0,
+            listen: None,
+        };
+        let f = |name: &str| dir.join(name);
+        for (wav, json) in [("c0000.wav", "c0000.json"), ("c0001.wav", "c0001.json"), ("c0001_p0000.wav", "c0001_p0000.json")] {
+            std::fs::write(f(wav), b"wav").unwrap();
+            std::fs::write(f(json), b"{}").unwrap();
+        }
+        std::fs::write(f("c0001.wav.stream.pcm"), b"pcm").unwrap(); // interrupted stream
+        std::fs::write(f("06_The_Salt_Road_c0006.wav"), b"wav").unwrap(); // already readable form
+        // chapter 1's timing target is taken, so that pair has to stay together
+        std::fs::write(f("01_The_Quiet_Harbor_c0001.json"), b"{}").unwrap();
+
+        let moves = migrate_audio_in(std::slice::from_ref(&b), &root.join("books"));
+        assert_eq!(moves.len(), 1);
+        // two pairs moved; the blocked pair is the one old-form pair that stayed
+        assert_eq!((moves[0].renamed, moves[0].left), (2, 1));
+        assert!(f("06_The_Salt_Road_c0006.wav").exists(), "a file with no section is left alone");
+        assert!(f("00_Title_Page_c0000.wav").exists() && f("00_Title_Page_c0000.json").exists());
+        assert!(f("c0001.wav").exists() && f("c0001.json").exists(), "the blocked pair stayed together");
+        assert!(!f("01_The_Quiet_Harbor_c0001.wav").exists(), "the wav did not move without its json");
+        assert!(f("01_The_Quiet_Harbor_c0001_p0000.wav").exists() && f("01_The_Quiet_Harbor_c0001_p0000.json").exists());
+        assert!(!f("c0001_p0000.wav").exists() && !f("c0001_p0000.json").exists());
+        assert!(!f("c0001.wav.stream.pcm").exists(), "stream leftover removed");
+        // idempotent: nothing left to rename
+        let again = migrate_audio_in(std::slice::from_ref(&b), &root.join("books"));
+        assert_eq!((again[0].renamed, again[0].left), (0, 1));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Runs the start-up migration and classification against a copy of a real library:
+    ///   MIGRATE_DIR=<folder> cargo test migrates_library_copy -- --ignored --nocapture
+    /// <folder> holds data/ (the copied books) and config/; nothing outside it is touched.
+    /// Prints folder name lengths, per voice folder renames, and per section kinds; no titles.
+    #[test]
+    #[ignore]
+    fn migrates_library_copy() {
+        let Ok(dir) = std::env::var("MIGRATE_DIR") else { return };
+        let root = PathBuf::from(dir).canonicalize().expect("MIGRATE_DIR must name an existing folder");
+        let (data, config) = (root.join("data"), root.join("config"));
+        let _ = std::fs::create_dir_all(&config);
+        std::env::set_var("INKVOICE_DATA", &data);
+        std::env::set_var("INKVOICE_CONFIG", &config);
+        let inside = |p: &Path| p.canonicalize().is_ok_and(|c| c.starts_with(&root));
+        if !data.is_dir() || !inside(&data) || !inside(&config) {
+            eprintln!("migrates_library_copy: refusing to run, data is {} and config is {}", data.display(), config.display());
+            return;
+        }
+        // exactly what the app runs at start-up, in the same order
+        for (from, to) in book::migrate_library() {
+            println!("folder length {} -> {}", from.chars().count(), to.chars().count());
+        }
+        let lib = book::load_library();
+        for m in migrate_audio_names(&lib) {
+            println!("book {} voice {}: renamed {}, left {}", m.book, m.profile, m.renamed, m.left);
+        }
+        for (bi, b) in lib.iter().enumerate() {
+            for (i, c) in b.chapters.iter().enumerate() {
+                println!("book {bi} section {i} kind {} skipped {}", c.kind.map(|k| k.label()).unwrap_or("unclassified"), c.skipped());
+            }
+        }
+    }
     #[test]
     fn profile_labels() {
         assert_eq!(config::profile_label("phonon-everly"), "Phonon · Everly");
@@ -1360,25 +1704,32 @@ mod screenshots {
         ok
     }
 
-    /// A tiny original book (four sections of four short pages) inside the scratch data,
-    /// so no real library is ever read. Nguyen appears so the regenerate offer has a hit.
+    /// A tiny original book (four sections of four short pages, plus short front and back
+    /// matter) inside the scratch data, so no real library is ever read. Nguyen appears so
+    /// the regenerate offer has a hit.
     fn fixture_book() -> book::Book {
         let line = |sec: usize, p: usize, n: usize| {
             format!("Nguyen {sec} counted {n} lanterns on page {p}, and the tide answered none of it.")
         };
+        let body = (1..=4).map(|sec| {
+            book::Chapter::new(
+                format!("Section {sec}"),
+                (1..=4).map(|p| (0..6).map(|n| line(sec, p, n)).collect::<Vec<_>>().join(" ")).collect(),
+            )
+        });
+        let extra = |title: &str, text: &str| book::Chapter::new(title.into(), vec![text.into()]);
+        let mut chapters = vec![
+            extra("Title Page", "The Salt Road"),
+            extra("Praise for The Salt Road", "A bright, patient novel of salt and weather. Nguyen writes harbors the way others write cities."),
+        ];
+        chapters.extend(body);
+        chapters.push(extra("About the Author", "Nguyen grew up between two ferry lines and writes about both."));
         book::Book {
             id: "shots_book".into(),
             title: "The Salt Road".into(),
             author: String::new(),
             source: String::new(),
-            chapters: (1..=4)
-                .map(|sec| {
-                    book::Chapter::new(
-                        format!("Section {sec}"),
-                        (1..=4).map(|p| (0..6).map(|n| line(sec, p, n)).collect::<Vec<_>>().join(" ")).collect(),
-                    )
-                })
-                .collect(),
+            chapters,
             pos: (0, 0),
             opened: 0,
             listen: None,
@@ -1401,7 +1752,7 @@ mod screenshots {
         };
         let mut h = Harness::builder().with_size([1280.0, 800.0]).build_eframe(|cc| App::new(cc, None));
         let id = h.state().lib[0].id.clone();
-        let shot_ch: usize = std::env::var("SHOT_CH").ok().and_then(|c| c.parse().ok()).unwrap_or(1);
+        let shot_ch: usize = std::env::var("SHOT_CH").ok().and_then(|c| c.parse().ok()).unwrap_or(3); // a body section; the fixture now opens with two skipped sections
         h.state_mut().sel = Some(id.clone());
         save(&mut h, "1_library");
 
@@ -1528,7 +1879,7 @@ mod screenshots {
         fixture_book().save().unwrap();
         let mut h = Harness::builder().with_size([1280.0, 800.0]).build_eframe(|cc| App::new(cc, None));
         let id = h.state().lib[0].id.clone();
-        let shot_ch: usize = std::env::var("SHOT_CH").ok().and_then(|c| c.parse().ok()).unwrap_or(1);
+        let shot_ch: usize = std::env::var("SHOT_CH").ok().and_then(|c| c.parse().ok()).unwrap_or(3);
         h.state_mut().open_reader(&id);
         h.state_mut().cfg.page_mode = true;
         if let Ok(e) = std::env::var("SHOT_ENGINE") {
