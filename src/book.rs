@@ -1,3 +1,4 @@
+use crate::sections::Kind;
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -9,6 +10,28 @@ const PDF_PAGES_PER_CHAPTER: usize = 10;
 pub struct Chapter {
     pub title: String,
     pub pages: Vec<String>,
+    /// structural label the source file gave this section, lowercase EPUB vocabulary
+    /// ("cover", "titlepage", "toc", "copyright-page", "bodymatter", ...; "nonlinear" for a
+    /// spine item marked linear="no"); None when the file says nothing
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub marker: Option<String>,
+    /// what the section is; None until the book has been classified
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<Kind>,
+    /// the reader's own choice to skip (true) or include (false) this section when listening;
+    /// None follows `kind`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip: Option<bool>,
+}
+
+impl Chapter {
+    pub fn new(title: String, pages: Vec<String>) -> Self {
+        Chapter { title, pages, marker: None, kind: None, skip: None }
+    }
+    /// Whether continuous listening and "Generate whole book" leave this section out.
+    pub fn skipped(&self) -> bool {
+        self.skip.unwrap_or_else(|| self.kind.is_some_and(Kind::skipped_by_default))
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -215,7 +238,7 @@ fn chapters_from_spine(doc: &mut epub::doc::EpubDoc<std::io::BufReader<std::fs::
             continue;
         }
         let title = title_from_text(&text).unwrap_or_else(|| format!("Section {}", chapters.len() + 1));
-        chapters.push(Chapter { title, pages: paginate(&text) });
+        chapters.push(Chapter::new(title, paginate(&text)));
     }
     chapters
 }
@@ -290,9 +313,8 @@ fn chapters_from_toc(doc: &mut epub::doc::EpubDoc<std::io::BufReader<std::fs::Fi
     parts
         .into_iter()
         .filter(|(_, t)| t.trim().chars().count() >= 20)
-        .map(|(title, text)| Chapter {
-            title: if title.is_empty() { "Untitled".into() } else { title.chars().take(80).collect() },
-            pages: paginate(text.trim()),
+        .map(|(title, text)| {
+            Chapter::new(if title.is_empty() { "Untitled".into() } else { title.chars().take(80).collect() }, paginate(text.trim()))
         })
         .collect()
 }
@@ -341,10 +363,7 @@ fn import_pdf(path: &Path, stem: &str) -> Result<Book> {
         .enumerate()
         .map(|(i, c)| {
             let start = i * PDF_PAGES_PER_CHAPTER + 1;
-            Chapter {
-                title: format!("Pages {}-{}", start, start + c.len() - 1),
-                pages: c.to_vec(),
-            }
+            Chapter::new(format!("Pages {}-{}", start, start + c.len() - 1), c.to_vec())
         })
         .collect();
     Ok(Book { id: String::new(), title: stem.to_string(), author: String::new(), source: String::new(), chapters, pos: (0, 0), opened: 0, listen: None })

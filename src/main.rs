@@ -3,6 +3,7 @@ mod book;
 mod config;
 mod installer;
 mod player;
+mod sections;
 mod theme;
 mod tts;
 mod ui;
@@ -1371,11 +1372,11 @@ mod screenshots {
             author: String::new(),
             source: String::new(),
             chapters: (1..=4)
-                .map(|sec| book::Chapter {
-                    title: format!("Section {sec}"),
-                    pages: (1..=4)
-                        .map(|p| (0..6).map(|n| line(sec, p, n)).collect::<Vec<_>>().join(" "))
-                        .collect(),
+                .map(|sec| {
+                    book::Chapter::new(
+                        format!("Section {sec}"),
+                        (1..=4).map(|p| (0..6).map(|n| line(sec, p, n)).collect::<Vec<_>>().join(" ")).collect(),
+                    )
                 })
                 .collect(),
             pos: (0, 0),
