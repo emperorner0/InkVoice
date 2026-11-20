@@ -2,7 +2,7 @@
 use crate::config::{self, Config, Kind};
 use crate::player::Unit;
 use crate::theme::*;
-use crate::{App, View};
+use crate::{export, App, View};
 use eframe::egui::{
     self, text::CCursor, text::LayoutJob, Align, Align2, Button, FontFamily, FontId, Frame, Key, Layout, Margin,
     Modifiers, ProgressBar, Rect, RichText, Sense, Slider, Stroke, StrokeKind, TextFormat, TextWrapMode, Vec2,
@@ -172,6 +172,9 @@ enum Act {
     CleanJunk(String),
     /// show one audio folder in the system file manager
     OpenAudioFolder(std::path::PathBuf),
+    /// open the Export window for one book and voice
+    ExportVoice(String, String),
+    /// play a short preview of a spoken form
     HearForm(String),
     /// commit a new spoken form for table row `row`
     PronSet(usize, String),
@@ -218,6 +221,7 @@ impl App {
             },
             Some(Act::CleanJunk(id)) => self.clean_leftovers(&id),
             Some(Act::OpenAudioFolder(p)) => crate::open_folder(&p),
+            Some(Act::ExportVoice(id, profile)) => self.open_export(&id, &profile),
             Some(Act::PronSet(row, say)) => {
                 // the word comes from the saved row, so a hand edit between frames cannot
                 // redirect the change onto another entry
@@ -330,6 +334,7 @@ impl App {
         self.settings_window(ctx);
         self.pron_window(ctx);
         self.install_window(ctx);
+        self.export_window(ctx);
         self.toast(ctx);
     }
 
@@ -639,6 +644,9 @@ impl App {
                                     if icon(ui, "📂", "Open this voice's folder in the file manager").clicked() {
                                         let dir = audio_root.as_ref().map(|r| r.join(&it.profile)).unwrap_or_default();
                                         act = Some(Act::OpenAudioFolder(dir));
+                                    }
+                                    if icon(ui, "📤", "Export this voice's audio…").clicked() {
+                                        act = Some(Act::ExportVoice(id.clone(), it.profile.clone()));
                                     }
                                 });
                             });
@@ -1960,6 +1968,151 @@ impl App {
                 self.try_engine(&engine);
             }
             None => {}
+        }
+    }
+
+    /// The Export window for one book and voice: what goes out, in which format, and
+    /// where. Its counts were gathered when it opened; drawing only reads them.
+    fn export_window(&mut self, ctx: &egui::Context) {
+        if self.export.is_none() {
+            return;
+        }
+        let busy = self.export.as_ref().is_some_and(|w| w.busy.is_some());
+        enum Ex {
+            Close,
+            Pick,
+            Start,
+            Cancel,
+            Open((std::path::PathBuf, bool)),
+        }
+        let mut act: Option<Ex> = None;
+        let mut open = true;
+        let mut win = egui::Window::new(RichText::new("Export audio").strong())
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .default_width(470.0)
+            .frame(Frame::window(&ctx.style()).inner_margin(Margin::same(20)));
+        if !busy {
+            win = win.open(&mut open);
+        }
+        win.show(ctx, |ui| {
+            let Some(w) = &mut self.export else { return };
+            ui.label(RichText::new(&w.title).strong().size(17.0));
+            let voice = config::profile_label(&w.voice);
+            let sub = if w.author.is_empty() { voice } else { format!("by {} · {}", w.author, voice) };
+            ui.label(RichText::new(sub).color(DIM));
+            ui.add_space(12.0);
+            let (kept, have) = export::counts(&w.chapters, w.include_skipped);
+            let dur: f32 = export::selected(&w.chapters, w.include_skipped)
+                .iter()
+                .filter_map(|&i| w.chapters[i].audio.as_ref())
+                .map(|a| a.dur)
+                .sum();
+            let plural = if have == 1 { "" } else { "s" };
+            ui.label(RichText::new(format!("{have} chapter{plural} · {}", fmt_time(dur))).small().color(DIM));
+            let missing = kept.saturating_sub(have);
+            if missing > 0 {
+                let (p1, p2) = (if have == 1 { "has" } else { "have" }, if missing == 1 { "is" } else { "are" });
+                ui.label(RichText::new(format!("{have} of {kept} chapters {p1} audio; the other {missing} {p2} left out")).small().color(DIM));
+            }
+            ui.add_space(8.0);
+            ui.add_enabled(!busy, egui::Checkbox::new(&mut w.include_skipped, "Include skipped sections"));
+            if !busy {
+                section(ui, "FORMAT");
+                ui.radio_value(&mut w.m4b, false, "One WAV file per chapter");
+                let m4b_avail = w.ffmpeg.is_some();
+                if ui.add_enabled(m4b_avail, egui::RadioButton::new(w.m4b, "One M4B file with chapters")).clicked() {
+                    w.m4b = true;
+                }
+                if !m4b_avail {
+                    ui.label(RichText::new("M4B export needs ffmpeg installed.").small().color(DIM));
+                }
+                section(ui, "DESTINATION");
+                ui.horizontal(|ui| {
+                    let label = if w.picking { "Choosing…" } else { "Choose folder…" };
+                    if ui.add_enabled(!w.picking, Button::new(label)).clicked() {
+                        act = Some(Ex::Pick);
+                    }
+                    ui.style_mut().wrap_mode = Some(TextWrapMode::Truncate);
+                    let text = w.dest.as_ref().map_or("No folder chosen yet".to_string(), |d| d.display().to_string());
+                    ui.label(RichText::new(text).small().color(DIM));
+                });
+                if let Some(e) = &w.dest_err {
+                    ui.label(RichText::new(e).small().color(DANGER));
+                }
+                ui.add_space(14.0);
+                let can = !w.picking && w.dest.is_some() && w.dest_err.is_none() && have > 0 && (!w.m4b || m4b_avail);
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(can, Button::new(RichText::new("Export").color(ON_ACCENT).strong()).fill(ACCENT)).clicked() {
+                        act = Some(Ex::Start);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        act = Some(Ex::Close);
+                    }
+                });
+            }
+            if let Some(b) = &w.busy {
+                let (frac, label, cancelling) = (b.frac, b.label.clone(), b.cancelling);
+                ui.add_space(10.0);
+                ui.label(RichText::new(if cancelling { "Cancelling…" } else { "Exporting…" }).strong());
+                ui.add(ProgressBar::new(frac).desired_height(8.0).fill(ACCENT).corner_radius(4.0));
+                ui.label(RichText::new(label).small().color(DIM));
+                ui.add_space(6.0);
+                if !cancelling && ui.button("Cancel").clicked() {
+                    act = Some(Ex::Cancel);
+                }
+            }
+            if let Some(r) = &w.result {
+                ui.add_space(10.0);
+                match r {
+                    Ok((p, true)) => {
+                        ui.label(RichText::new(format!("Done. The audiobook is {}", p.display())).color(DIM));
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Open folder").clicked() {
+                                act = Some(Ex::Open((p.clone(), true)));
+                            }
+                            if ui.button("Close").clicked() {
+                                act = Some(Ex::Close);
+                            }
+                        });
+                    }
+                    Ok((p, false)) => {
+                        ui.label(RichText::new(format!("Done. The files are in {}", p.display())).color(DIM));
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Open folder").clicked() {
+                                act = Some(Ex::Open((p.clone(), false)));
+                            }
+                            if ui.button("Close").clicked() {
+                                act = Some(Ex::Close);
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        ui.label(RichText::new(format!("Export failed: {e}")).color(DANGER));
+                        ui.add_space(8.0);
+                        if ui.button("Close").clicked() {
+                            act = Some(Ex::Close);
+                        }
+                    }
+                }
+            }
+        });
+        match act {
+            Some(Ex::Close) => self.export = None,
+            Some(Ex::Pick) => self.pick_export_dest(),
+            Some(Ex::Start) => self.start_export(),
+            Some(Ex::Cancel) => self.cancel_export(),
+            Some(Ex::Open((p, m4b))) => {
+                let dir = if m4b { p.parent().map(std::path::Path::to_path_buf).unwrap_or(p) } else { p };
+                crate::open_folder(&dir);
+            }
+            None => {}
+        }
+        if !open {
+            self.export = None;
         }
     }
 

@@ -1,6 +1,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")] // no console window on Windows
 mod book;
 mod config;
+mod export;
 mod installer;
 mod player;
 mod sections;
@@ -14,7 +15,9 @@ use eframe::egui;
 use player::{Player, Unit};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::Arc;
 use std::time::Instant;
 
 const WORKERS: &[(&str, &str)] = &[
@@ -160,6 +163,12 @@ pub struct App {
     import_rx: Receiver<Result<Book, String>>,
     import_tx: Sender<Result<Book, String>>,
     importing: bool,
+    /// the Export window for one book and voice (None = closed)
+    export: Option<export::ExportWin>,
+    export_rx: Receiver<export::Msg>,
+    export_tx: Sender<export::Msg>,
+    /// last export destination, remembered for the session
+    export_dir: Option<PathBuf>,
     player: Option<Player>,
     /// ready wav files of the open book for the current voice profile
     have: HashSet<PathBuf>,
@@ -232,6 +241,7 @@ impl App {
         let cfg = Config::load();
         cfg.save();
         let (import_tx, import_rx) = channel();
+        let (export_tx, export_rx) = channel();
         let tts = tts::Tts::start(cfg.worker_command(), cfg.normalize_key(), cc.egui_ctx.clone());
         let mut app = Self {
             lib: migrate_startup(),
@@ -247,6 +257,10 @@ impl App {
             import_rx,
             import_tx,
             importing: false,
+            export: None,
+            export_rx,
+            export_tx,
+            export_dir: None,
             player: Player::new(cfg.volume, cfg.speed),
             status: None,
             ctx: cc.egui_ctx.clone(),
@@ -610,6 +624,83 @@ impl App {
             let _ = tx.send(book::import(&p).map_err(|e| e.to_string()));
             ctx.request_repaint();
         });
+    }
+
+    // ---------- export ----------
+
+    /// Open the Export window for one book and voice, gathering its chapter counts once.
+    fn open_export(&mut self, id: &str, profile: &str) {
+        let Some(b) = self.book(id) else { return };
+        let dest = self.export_dir.clone();
+        self.export = Some(export::ExportWin::new(b, profile, &b.dir().join("audio").join(profile), dest));
+    }
+
+    /// Ask where the export should go. The folder dialog runs on its own thread, like the
+    /// import one, and the answer arrives through the export channel.
+    fn pick_export_dest(&mut self) {
+        if self.export.as_ref().is_some_and(|w| w.picking || w.busy.is_some()) {
+            return;
+        }
+        if let Some(w) = &mut self.export {
+            w.picking = true;
+        }
+        let (tx, ctx) = (self.export_tx.clone(), self.ctx.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(export::Msg::Dest(rfd::FileDialog::new().pick_folder()));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Start the export on a background thread; progress and the outcome arrive through
+    /// the export channel and are applied in `poll`.
+    fn start_export(&mut self) {
+        let Some(w) = &self.export else { return };
+        if w.busy.is_some() || w.picking || w.dest.is_none() || w.dest_err.is_some() {
+            return;
+        }
+        if let Some(e) = export::dest_refusal(w.dest.as_ref().unwrap(), &data_dir()) {
+            if let Some(w) = &mut self.export {
+                w.dest_err = Some(e);
+            }
+            return;
+        }
+        let plan = w.plan();
+        if plan.chapters.is_empty() {
+            return;
+        }
+        let (m4b, ffmpeg) = (w.m4b, w.ffmpeg.clone());
+        if m4b && ffmpeg.is_none() {
+            return;
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        if let Some(w) = &mut self.export {
+            w.result = None;
+            w.busy = Some(export::Busy { cancel: cancel.clone(), frac: 0.0, label: String::new(), cancelling: false });
+        }
+        let (tx, ctx) = (self.export_tx.clone(), self.ctx.clone());
+        std::thread::spawn(move || {
+            let mut prog = |frac: f32, label: &str| {
+                let _ = tx.send(export::Msg::Progress(frac, label.to_string()));
+                ctx.request_repaint();
+            };
+            let r = if m4b {
+                export::run_m4b(&plan, ffmpeg.as_deref(), &cancel, &mut prog)
+            } else {
+                export::run_wav(&plan, &cancel, &mut prog)
+            };
+            let _ = tx.send(export::Msg::Done(r));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Ask the running export to stop; it removes its temporary files itself.
+    fn cancel_export(&mut self) {
+        if let Some(w) = &mut self.export {
+            if let Some(b) = &mut w.busy {
+                b.cancelling = true;
+                b.cancel.store(true, Ordering::Relaxed);
+            }
+        }
     }
 
     // ---------- generation ----------
@@ -1309,6 +1400,48 @@ impl App {
             }
         }
 
+        while let Ok(m) = self.export_rx.try_recv() {
+            match m {
+                export::Msg::Dest(d) => {
+                    if let Some(d) = d {
+                        self.export_dir = Some(d.clone());
+                        if let Some(w) = self.export.as_mut() {
+                            w.picking = false;
+                            w.dest = Some(d);
+                            w.dest_err = export::dest_refusal(w.dest.as_ref().unwrap(), &data_dir());
+                        }
+                    } else if let Some(w) = self.export.as_mut() {
+                        w.picking = false;
+                    }
+                }
+                export::Msg::Progress(f, l) => {
+                    if let Some(w) = self.export.as_mut() {
+                        if let Some(b) = &mut w.busy {
+                            b.frac = f;
+                            b.label = l;
+                        }
+                    }
+                }
+                export::Msg::Done(Ok(p)) => {
+                    if let Some(w) = self.export.as_mut() {
+                        let m4b = w.m4b; // the format cannot change while the run is going
+                        w.busy = None;
+                        w.result = Some(Ok((p, m4b)));
+                    }
+                }
+                export::Msg::Done(Err(export::ExportErr::Cancelled)) => {
+                    self.export = None;
+                    self.notify("Export cancelled");
+                }
+                export::Msg::Done(Err(export::ExportErr::Msg(e))) => {
+                    if let Some(w) = self.export.as_mut() {
+                        w.busy = None;
+                        w.result = Some(Err(e));
+                    }
+                }
+            }
+        }
+
         // audio ran out: continue with the next chapter/page
         if self.player.as_ref().is_some_and(|p| p.finished()) {
             let u = self.player.as_ref().unwrap().now.as_ref().unwrap().unit.clone();
@@ -1872,7 +2005,7 @@ fn unix_secs(t: std::time::SystemTime) -> u64 {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         self.poll();
-        if self.job.is_some() || self.install.is_some() || self.inst.result.is_some() || self.player.as_ref().is_some_and(|p| p.now.is_some()) || self.status.is_some() {
+        if self.job.is_some() || self.install.is_some() || self.inst.result.is_some() || self.player.as_ref().is_some_and(|p| p.now.is_some()) || self.status.is_some() || self.export.as_ref().is_some_and(|w| w.busy.is_some() || w.picking) {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
         self.shortcuts(ctx);
@@ -2088,9 +2221,12 @@ mod tests {
 
     /// A minimal 16-bit mono wav of `bytes` bytes (24000 Hz), so scans see a real size.
     pub(crate) fn wav_bytes(bytes: usize) -> Vec<u8> {
-        let mut w = vec![0u8; bytes.max(44)];
-        let data = (w.len() - 44) as u32;
-        w[4..8].copy_from_slice(&data.to_le_bytes());
+        // the data chunk holds whole samples, like real audio (an odd tail would be a
+        // corrupt file), so the file may come out one byte shorter than asked for
+        let data = ((bytes.max(44) - 44) / 2 * 2) as u32;
+        let mut w = vec![0u8; 44 + data as usize];
+        w[0..4].copy_from_slice(b"RIFF");
+        w[4..8].copy_from_slice(&(36 + data).to_le_bytes());
         w[8..12].copy_from_slice(b"WAVE");
         w[12..16].copy_from_slice(b"fmt ");
         w[16..20].copy_from_slice(&16u32.to_le_bytes());
@@ -2332,12 +2468,24 @@ mod screenshots {
 
     /// Redirect the app to scratch folders inside the SHOTS dir and return false when the
     /// redirect did not take (on Windows the Known Folder API ignores LOCALAPPDATA and
-    /// APPDATA, so only INKVOICE_DATA/INKVOICE_CONFIG actually work there).
+    /// APPDATA, so only INKVOICE_DATA/INKVOICE_CONFIG actually work there). These tests
+    /// clear the scratch library before they start, so the data folder must be one this
+    /// function created: it leaves a marker file in a folder that was empty or absent, and
+    /// refuses any other folder, such as a real library that happens to be at <SHOTS>/data.
     fn scratch(dir: &str) -> bool {
         let root = PathBuf::from(dir);
         let (data, config) = (root.join("data"), root.join("config"));
+        let marker = data.join(".inkvoice-test-scratch");
+        let fresh = std::fs::read_dir(&data).map_or(true, |mut d| d.next().is_none());
         let _ = std::fs::create_dir_all(&data);
         let _ = std::fs::create_dir_all(&config);
+        if fresh {
+            let _ = std::fs::write(&marker, b"");
+        }
+        if !marker.is_file() {
+            eprintln!("screenshots: refusing to run, {} holds files and is not a test folder", data.display());
+            return false;
+        }
         std::env::set_var("INKVOICE_DATA", &data);
         std::env::set_var("INKVOICE_CONFIG", &config);
         let ok = book::data_dir().starts_with(&root) && book::config_dir().starts_with(&root);
@@ -2383,6 +2531,10 @@ mod screenshots {
         }
     }
 
+    /// The two screenshot tests share one scratch data folder; this keeps them from
+    /// running at the same time and stepping on each other's book.
+    static SHOTS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     #[ignore]
     fn screenshots() {
@@ -2390,6 +2542,11 @@ mod screenshots {
         if !scratch(&dir) {
             return;
         }
+        let _lock = SHOTS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // exactly one book per run: a leftover of an earlier run would crowd the library
+        // and the details panel (the fixture id is legacy-form, so the app renames the
+        // folder at start-up and a second run would add a second folder)
+        let _ = std::fs::remove_dir_all(book::books_dir());
         let mut book = fixture_book();
         book.chapters[4].title = "Section 3 - The Long Crossing Home from the Islands".into();
         book.save().unwrap();
@@ -2431,6 +2588,37 @@ mod screenshots {
         h.state_mut().ask_del_all(&id, DelAll::Voice("kokoro-af_heart".into()));
         save(&mut h, "audio_delete_confirm");
         h.state_mut().confirm_del_audio = None;
+
+        // the export window: M4B offered (ffmpeg on the PATH), mid-run, without ffmpeg, and done
+        h.state_mut().open_export(&id, "kokoro-af_heart");
+        let long_dest = PathBuf::from(&dir).join("Audiobooks to take along on the long ferry ride home");
+        if let Some(w) = h.state_mut().export.as_mut() {
+            w.dest = Some(long_dest.clone());
+        }
+        save(&mut h, "export_window");
+        let s = h.state_mut();
+        if let Some(w) = &mut s.export {
+            w.busy = Some(export::Busy {
+                cancel: Arc::new(AtomicBool::new(false)),
+                frac: 0.62,
+                label: "Salt and Weather · 2 of 3".into(),
+                cancelling: false,
+            });
+        }
+        save(&mut h, "export_running");
+        if let Some(w) = h.state_mut().export.as_mut() {
+            w.busy = None;
+            w.ffmpeg = None;
+        }
+        save(&mut h, "export_no_ffmpeg");
+        let s = h.state_mut();
+        if let Some(w) = &mut s.export {
+            w.ffmpeg = export::find_ffmpeg();
+            w.m4b = true;
+            w.result = Some(Ok((long_dest.join("The Salt Road.m4b"), true)));
+        }
+        save(&mut h, "export_done");
+        h.state_mut().export = None;
 
         let s = h.state_mut();
         s.open_reader(&id);
@@ -2552,6 +2740,8 @@ mod screenshots {
         if !scratch(&dir) {
             return;
         }
+        let _lock = SHOTS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = std::fs::remove_dir_all(book::books_dir());
         fixture_book().save().unwrap();
         let mut h = Harness::builder().with_size([1280.0, 800.0]).build_eframe(|cc| App::new(cc, None));
         let id = h.state().lib[0].id.clone();
