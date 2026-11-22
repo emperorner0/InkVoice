@@ -519,10 +519,8 @@ impl App {
     fn delete_section_audio(&mut self, id: &str, ch: usize) {
         let Some(b) = self.book(id) else { return };
         let dir = b.dir().join("audio").join(self.cfg.profile());
-        let pages = b.chapters.get(ch).map_or(0, |c| c.pages.len());
-        let units: Vec<Option<usize>> = if self.cfg.page_mode { (0..pages).map(Some).collect() } else { vec![None] };
         let title = b.chapters.get(ch).map(|c| c.title.clone()).unwrap_or_default();
-        let files: Vec<PathBuf> = units.iter().flat_map(|pg| unit_files(&dir, ch, *pg)).collect();
+        let files = section_audio_paths(b, &dir, ch, self.cfg.page_mode);
         let r = self.trash_audio(id, &files);
         self.report_delete(id, r, &format!("Deleted the audio of {title}"));
     }
@@ -1645,6 +1643,19 @@ fn unit_files(dir: &Path, ch: usize, pg: Option<usize>) -> Vec<PathBuf> {
     out
 }
 
+/// Everything "delete this section's audio" covers in a voice folder: the wav each of its
+/// units is generated to, present or still queued, and the unit's files in any name form.
+fn section_audio_paths(b: &Book, dir: &Path, ch: usize, page_mode: bool) -> Vec<PathBuf> {
+    let pages = b.chapters.get(ch).map_or(0, |c| c.pages.len());
+    let units: Vec<Option<usize>> = if page_mode { (0..pages).map(Some).collect() } else { vec![None] };
+    let mut out = Vec::new();
+    for pg in units {
+        out.push(dir.join(unit_stem(b, ch, pg)).with_extension("wav"));
+        out.extend(unit_files(dir, ch, pg));
+    }
+    out
+}
+
 /// Delete every audio (and timing) file for one unit key in a voice folder, any name form.
 fn remove_unit_files(dir: &Path, ch: usize, pg: Option<usize>) {
     for p in unit_files(dir, ch, pg) {
@@ -2405,6 +2416,33 @@ mod tests {
         assert!(pending.is_empty() && job.is_none(), "the queued unit was cancelled and cleared");
         assert_eq!(std::fs::read_dir(&v).unwrap().count(), 0, "the voice folder is empty");
         assert!(other.exists(), "other voices are untouched");
+        let _ = std::fs::remove_dir_all(audio.parent().unwrap());
+    }
+
+    /// Page mode with the first page done and the second still queued: deleting the section's
+    /// audio takes the finished page and cancels the queued one, so it cannot come back.
+    #[test]
+    fn deleting_a_section_cancels_its_queued_pages() {
+        let (_dir, b, audio) = audio_tree("section");
+        let v = audio.join("kokoro-af_heart");
+        let done = put(&v, "01_The_Quiet_Harbor_c0001_p0000.wav", &wav_bytes(4096));
+        put(&v, "01_The_Quiet_Harbor_c0001_p0000.json", b"{}");
+        let queued = v.join("01_The_Quiet_Harbor_c0001_p0001.wav");
+        let other = v.join("00_Title_Page_c0000_p0000.wav"); // another section, also queued
+        let tts = tts::Tts::start(vec!["no-such-engine".into()], None, eframe::egui::Context::default());
+        let mut pending: HashMap<PathBuf, String> =
+            HashMap::from([(queued.clone(), "The Quiet Harbor".into()), (other.clone(), "Title Page".into())]);
+        let mut job = Some(Job { path: queued.clone(), progress: 0.4, started: Instant::now() });
+
+        let paths = section_audio_paths(&b, &v, 1, true);
+        for p in &paths {
+            halt_unit_audio(&mut None, &mut None, &mut pending, &mut job, p, &tts);
+        }
+        let r = delete_audio_files(&paths, &audio, &mut PlainRemove);
+        assert_eq!((r.moved, r.failed.is_none()), (2, true), "the finished page and its timing file");
+        assert!(!done.exists());
+        assert!(!pending.contains_key(&queued) && job.is_none(), "the queued page was cancelled");
+        assert!(pending.contains_key(&other), "other sections stay queued");
         let _ = std::fs::remove_dir_all(audio.parent().unwrap());
     }
 
