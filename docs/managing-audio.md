@@ -40,8 +40,8 @@ how much space they take.
   removes that section's audio files for the current voice, and only appears when the
   section has audio.
 
-Everything the panel deletes goes to the Recycle Bin (the system trash on Linux and macOS),
-where it can be restored. When a file cannot be moved there, the app leaves it where it is
+Everything the panel deletes goes to the Recycle Bin, where it can be restored. When a file
+cannot be moved there, the app leaves it where it is
 and says why; it never deletes permanently on its own. Files that are playing are stopped
 first, and a section whose audio is queued or being generated is cancelled before its files
 are deleted, so deleted audio does not quietly reappear. Deletion only ever touches files

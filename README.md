@@ -1,9 +1,9 @@
 # InkVoice
 
 This is a fork of [sabeel111/InkVoice](https://github.com/sabeel111/InkVoice) with a cloned-voice engine,
-a pronunciation helper, audio management and export added. See [What this fork adds](#what-this-fork-adds)
-and its [known issues](#known-issues). Downloads are on this fork's
-[Releases](https://github.com/emperorner0/InkVoice/releases) page.
+a pronunciation helper, audio management and export added. It is for Windows only. See
+[What this fork adds](#what-this-fork-adds) and its [known issues](#known-issues). Downloads are on this
+fork's [Releases](https://github.com/emperorner0/InkVoice/releases) page.
 
 A tiny, dark-mode ebook reader that turns your EPUB and PDF books into audiobooks — with small
 text-to-speech models running entirely on your own machine. No cloud, no Electron, and no PyTorch unless
@@ -13,7 +13,7 @@ you choose the optional Qwen3 engine.
 
 ## Features
 
-- **Native & light** — a single ~10 MB app (Rust + egui) for Linux and Windows. Dark theme built for reading at night.
+- **Native & light** — a single ~10 MB app (Rust + egui) for Windows. Dark theme built for reading at night.
 - **Library** with real cover art, reading progress, search, and every generated audio file per voice.
 - **Read page by page or by chapter**, serif typography, adjustable size / spacing / width.
 - **Listen per chapter or per page**, generated on your machine.
@@ -76,8 +76,8 @@ This repository is a fork of [sabeel111/InkVoice](https://github.com/sabeel111/I
 
 ### Known issues
 
-- The fork has been built and used on Windows 11 only. The Linux package is produced by the same build
-  workflow but has not been run.
+- This fork is for Windows only and has been built and used on Windows 11. It is not built, packaged or
+  tested for Linux; use the original project there.
 - The Qwen3 engine's in-app install has been run on one Windows machine with an NVIDIA GPU, nowhere else.
   It lists one voice, `narrator`, and reads English only.
 - If Phonon is installed, removing Qwen3 leaves about 3 GB of its model files in the shared download
@@ -103,13 +103,6 @@ Download **`InkVoice-Setup-x86_64.exe`** from this fork's
 portable zip. Windows may show a SmartScreen warning because the app isn't code-signed; choose
 *More info → Run anyway*. Open InkVoice from the Start menu when setup has finished.
 
-### Linux (x86_64)
-
-Download `inkvoice-linux-x86_64.tar.gz` from this fork's
-[Releases](https://github.com/emperorner0/InkVoice/releases), unpack it and run `./install.sh` (installs for
-your user, no root). `./install.sh --uninstall` removes it. This package is untested; see the known issues.
-The original project's one-line installer installs the original InkVoice, without the additions of this fork.
-
 ### Voices
 
 On first start, open **Settings → Voice engines** and install a voice. InkVoice downloads everything it needs
@@ -120,8 +113,8 @@ system-wide and no Python knowledge is needed. Remove engines there too.
 
 ```sh
 git clone https://github.com/emperorner0/InkVoice.git && cd InkVoice
-cargo build --release          # Linux needs ALSA headers (libasound2-dev / alsa-lib)
-./target/release/inkvoice
+cargo build --release
+.\target\release\inkvoice.exe
 ```
 
 Open a book directly with `inkvoice path/to/book.epub`, or import headlessly with `inkvoice --import book.epub`.
@@ -160,9 +153,8 @@ Each engine is a small worker process; the UI never links a model, so engines ca
 added or removed without touching the app. Word timings are estimated by matching punctuation to the
 pauses detected in the audio; the Qwen3 engine measures them against the audio instead.
 
-Data lives in `~/.local/share/inkvoice` (Windows: `%LOCALAPPDATA%\inkvoice`) — books, audio, voice engines —
-and settings in `~/.config/inkvoice/config.json` (Windows: `%APPDATA%\inkvoice`). Set `INKVOICE_DATA` and
-`INKVOICE_CONFIG` to use other folders.
+Data lives in `%LOCALAPPDATA%\inkvoice` (books, audio, voice engines) and settings in
+`%APPDATA%\inkvoice\config.json`. Set `INKVOICE_DATA` and `INKVOICE_CONFIG` to use other folders.
 
 ## License
 
