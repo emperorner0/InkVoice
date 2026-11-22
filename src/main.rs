@@ -875,7 +875,7 @@ impl App {
         if self.cfg.engine == name {
             self.cancel_generation();
         }
-        installer::remove(name);
+        installer::remove(name, self.install.is_none());
         self.installed.remove(name);
         self.confirm_uninstall = None;
         if self.cfg.engine == name {

@@ -47,10 +47,9 @@ This repository is a fork of [sabeel111/InkVoice](https://github.com/sabeel111/I
 
 - Qwen3 cloned-voice engine: a fourth engine that clones the voice in a reference sample. It needs an NVIDIA
   GPU with about 3 GB of free GPU memory. It installs from the app's voice-engine settings like the other
-  engines, into its own Python environment (about 7 GB with PyTorch and the model); that in-app install has
-  not been tested yet. A voice is a folder `<InkVoice data>/voices/<name>/` holding `ref.wav`, a clean 10 to
-  25 s sample of the voice, and `ref.txt`, the exact words spoken in that sample. The app currently lists one
-  voice, `narrator`.
+  engines, into its own Python environment (about 7 GB with PyTorch and the model). A voice is a folder
+  `<InkVoice data>/voices/<name>/` holding `ref.wav`, a clean 10 to 25 s sample of the voice, and `ref.txt`,
+  the exact words spoken in that sample. The app currently lists one voice, `narrator`.
 - Measured word timings for that engine: a small wav2vec2 model force-aligns the generated audio to the text,
   so the highlighted word follows the voice. If alignment fails, the app falls back to the estimated timings
   from punctuation and pauses.
@@ -79,8 +78,10 @@ This repository is a fork of [sabeel111/InkVoice](https://github.com/sabeel111/I
 
 - The fork has been built and used on Windows 11 only. The Linux package is produced by the same build
   workflow but has not been run.
-- Installing the Qwen3 engine from inside the app has not been tested; it was set up by hand during
-  development. It lists one voice, `narrator`, and reads English only.
+- The Qwen3 engine's in-app install has been run on one Windows machine with an NVIDIA GPU, nowhere else.
+  It lists one voice, `narrator`, and reads English only.
+- If Phonon is installed, removing Qwen3 leaves about 3 GB of its model files in the shared download
+  folder until Phonon is removed too.
 - The optional language-model pass of the pronunciation helper is unreliable on some words with the small
   local model that was tested: on real sentences it chose the right reading of "read" 5 times out of 13. The
   built-in rules and the pronunciation table do not have this problem and are the recommended way to use it.
@@ -91,7 +92,7 @@ This repository is a fork of [sabeel111/InkVoice](https://github.com/sabeel111/I
 - PDFs are imported as fixed 10-page chunks, so front and back matter is rarely recognised in them.
 - Renaming a section later does not rename audio files that already exist; they keep working.
 - Export has been tested on a short generated book, not on a full-length one. M4B export needs `ffmpeg`
-  installed separately and was tried with ffmpeg 4.2 only; MP3 and FLAC are not offered.
+  installed separately and was tried with ffmpeg 4.2 and 4.4 only; MP3 and FLAC are not offered.
 
 ## Install
 

@@ -177,13 +177,25 @@ fn installed_in(name: &str, d: &Path) -> bool {
 
 /// Remove an engine's model files (the shared Python environment stays; it is small).
 /// Qwen3 runs in its own environment, `venv-qwen3`, which is removed with it.
-pub fn remove(name: &str) {
-    remove_in(name, &data_dir());
+/// `clear_cache` also empties the package download cache; pass false while an install is
+/// running, since that install is using it.
+pub fn remove(name: &str, clear_cache: bool) {
+    let d = data_dir();
+    remove_in(name, &d);
     if name == "phonon" {
         if let Some(py) = venv_python().to_str() {
             let _ = uv_cmd(&["pip", "uninstall", "--python", py, "ptts"]).output();
         }
     }
+    if clear_cache {
+        clear_download_cache(&d);
+    }
+}
+
+/// Empty the cache of packages downloaded for installs (several GB after a Qwen3 install).
+/// Installed engines keep their own copies, so this only costs a download on the next install.
+fn clear_download_cache(d: &Path) {
+    let _ = std::fs::remove_dir_all(d.join("cache").join("uv"));
 }
 
 /// The folder half of [`remove`] on a given data folder, so it can be tested on a temporary
@@ -837,6 +849,24 @@ mod tests {
         super::remove_in("qwen3", &d);
         assert!(hub.join("models--other--thing").is_dir(), "a foreign folder keeps the cache");
         assert!(hub.join("blobs").is_dir());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn clearing_the_download_cache_leaves_engines_installed() {
+        let d = std::env::temp_dir().join(format!("inkvoice-clear-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        fake_install(&d, "kokoro");
+        fake_install(&d, "qwen3");
+        let wheel = d.join("cache").join("uv").join("wheels").join("torch.whl");
+        std::fs::create_dir_all(wheel.parent().unwrap()).unwrap();
+        std::fs::write(&wheel, b"x").unwrap();
+        std::fs::create_dir_all(d.join("tools")).unwrap();
+        std::fs::create_dir_all(d.join("python")).unwrap();
+        super::clear_download_cache(&d);
+        assert!(!d.join("cache").join("uv").exists());
+        assert!(super::installed_in("kokoro", &d) && super::installed_in("qwen3", &d));
+        assert!(d.join("tools").is_dir() && d.join("python").is_dir(), "the installer's own tools stay");
         let _ = std::fs::remove_dir_all(&d);
     }
 
