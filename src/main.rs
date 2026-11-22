@@ -502,7 +502,7 @@ impl App {
             return Deleted { moved: 0, failed: Some((PathBuf::new(), "book not found".into())) };
         };
         for p in paths {
-            halt_unit_audio(&mut self.player, &mut self.feed, &mut self.pending, &mut self.job, p, &self.tts);
+            halt_unit_audio(&mut self.player, &mut self.feed, &mut self.pending, &mut self.job, &mut self.autoplay, p, &self.tts);
         }
         delete_audio_files(paths, &audio_dir, &mut RecycleBin)
     }
@@ -544,7 +544,7 @@ impl App {
         let Some(b) = self.book(id) else { return };
         let dir = b.dir().join("audio").join(profile);
         let audio = b.dir().join("audio");
-        let r = clear_audio_dir(&dir, &audio, &mut self.player, &mut self.feed, &mut self.pending, &mut self.job, &self.tts, &mut RecycleBin);
+        let r = clear_audio_dir(&dir, &audio, &mut self.player, &mut self.feed, &mut self.pending, &mut self.job, &mut self.autoplay, &self.tts, &mut RecycleBin);
         let _ = std::fs::remove_dir(&dir); // empty now
         self.report_delete(id, r, &format!("Deleted all {} audio", config::profile_label(profile)));
     }
@@ -555,7 +555,7 @@ impl App {
         self.confirm_del_audio = None;
         let Some(b) = self.book(id) else { return };
         let root = b.dir().join("audio");
-        let r = clear_audio_dir(&root, &root, &mut self.player, &mut self.feed, &mut self.pending, &mut self.job, &self.tts, &mut RecycleBin);
+        let r = clear_audio_dir(&root, &root, &mut self.player, &mut self.feed, &mut self.pending, &mut self.job, &mut self.autoplay, &self.tts, &mut RecycleBin);
         if let Ok(rd) = std::fs::read_dir(&root) {
             for d in rd.flatten().map(|e| e.path()).filter(|p| p.is_dir()) {
                 let _ = std::fs::remove_dir(d); // empty voice folders
@@ -1686,6 +1686,7 @@ fn halt_unit_audio(
     feed: &mut Option<Feed>,
     pending: &mut HashMap<PathBuf, String>,
     job: &mut Option<Job>,
+    autoplay: &mut Option<PathBuf>,
     wav: &Path,
     tts: &tts::Tts,
 ) {
@@ -1703,6 +1704,9 @@ fn halt_unit_audio(
             *job = None;
         }
     }
+    if autoplay.as_deref() == Some(wav) {
+        *autoplay = None;
+    }
 }
 
 /// Halt everything under a folder: playback of any file in it, its stream feed, and every
@@ -1713,6 +1717,7 @@ fn halt_audio_under(
     feed: &mut Option<Feed>,
     pending: &mut HashMap<PathBuf, String>,
     job: &mut Option<Job>,
+    autoplay: &mut Option<PathBuf>,
     tts: &tts::Tts,
     dir: &Path,
 ) {
@@ -1732,6 +1737,9 @@ fn halt_audio_under(
             *job = None;
         }
     }
+    if autoplay.as_ref().is_some_and(|a| a.starts_with(dir)) {
+        *autoplay = None;
+    }
 }
 
 /// The core of "delete all audio in this folder" (one voice, or a book's whole audio
@@ -1744,10 +1752,11 @@ fn clear_audio_dir(
     feed: &mut Option<Feed>,
     pending: &mut HashMap<PathBuf, String>,
     job: &mut Option<Job>,
+    autoplay: &mut Option<PathBuf>,
     tts: &tts::Tts,
     rm: &mut dyn Remover,
 ) -> Deleted {
-    halt_audio_under(player, feed, pending, job, tts, dir);
+    halt_audio_under(player, feed, pending, job, autoplay, tts, dir);
     let files = folder_files(dir);
     delete_audio_files(&files, audio_dir, rm)
 }
@@ -2411,9 +2420,11 @@ mod tests {
         let mut pending = HashMap::from([(queued.clone(), "The Quiet Harbor".into())]);
         let mut job = Some(Job { path: queued.clone(), progress: 0.4, started: Instant::now() });
 
-        let r = clear_audio_dir(&v, &audio, &mut None, &mut None, &mut pending, &mut job, &tts, &mut PlainRemove);
+        let mut autoplay = Some(queued.clone());
+        let r = clear_audio_dir(&v, &audio, &mut None, &mut None, &mut pending, &mut job, &mut autoplay, &tts, &mut PlainRemove);
         assert_eq!((r.moved, r.failed.is_none()), (3, true), "two files and the stream temp");
         assert!(pending.is_empty() && job.is_none(), "the queued unit was cancelled and cleared");
+        assert!(autoplay.is_none(), "and it is no longer waiting to be played");
         assert_eq!(std::fs::read_dir(&v).unwrap().count(), 0, "the voice folder is empty");
         assert!(other.exists(), "other voices are untouched");
         let _ = std::fs::remove_dir_all(audio.parent().unwrap());
@@ -2434,14 +2445,16 @@ mod tests {
             HashMap::from([(queued.clone(), "The Quiet Harbor".into()), (other.clone(), "Title Page".into())]);
         let mut job = Some(Job { path: queued.clone(), progress: 0.4, started: Instant::now() });
 
+        let mut autoplay = Some(queued.clone());
         let paths = section_audio_paths(&b, &v, 1, true);
         for p in &paths {
-            halt_unit_audio(&mut None, &mut None, &mut pending, &mut job, p, &tts);
+            halt_unit_audio(&mut None, &mut None, &mut pending, &mut job, &mut autoplay, p, &tts);
         }
         let r = delete_audio_files(&paths, &audio, &mut PlainRemove);
         assert_eq!((r.moved, r.failed.is_none()), (2, true), "the finished page and its timing file");
         assert!(!done.exists());
         assert!(!pending.contains_key(&queued) && job.is_none(), "the queued page was cancelled");
+        assert!(autoplay.is_none(), "and it is no longer waiting to be played");
         assert!(pending.contains_key(&other), "other sections stay queued");
         let _ = std::fs::remove_dir_all(audio.parent().unwrap());
     }
@@ -2459,10 +2472,12 @@ mod tests {
 
         let tts = tts::Tts::start(vec!["no-such-engine".into()], None, eframe::egui::Context::default());
         let mut pending = HashMap::new();
-        let r = clear_audio_dir(&audio, &audio, &mut None, &mut None, &mut pending, &mut None, &tts, &mut PlainRemove);
+        let mut autoplay = Some(PathBuf::from("books/another_book/audio/kokoro-af_heart/c0000.wav"));
+        let r = clear_audio_dir(&audio, &audio, &mut None, &mut None, &mut pending, &mut None, &mut autoplay, &tts, &mut PlainRemove);
         assert_eq!((r.moved, r.failed.is_none()), (4, true), "every voice's files");
         assert!(keep.exists() && dir.join("progress.json").exists() && dir.join("cover.png").exists());
         assert!(!audio.join("kokoro-af_heart").join("00_Title_Page_c0000.wav").exists());
+        assert!(autoplay.is_some(), "a unit of another book that waits to be played still waits");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -2510,8 +2525,9 @@ mod tests {
         let mut pending = HashMap::from([(wav.clone(), "The Quiet Harbor".into())]);
         let mut job = Some(Job { path: wav.clone(), progress: 0.4, started: Instant::now() });
         let mut feed = Some(Feed { out: wav.clone(), pcm: wav.clone(), read: 6 });
-        halt_unit_audio(&mut None, &mut feed, &mut pending, &mut job, &wav, &tts);
-        assert!(pending.is_empty() && job.is_none() && feed.is_none());
+        let mut autoplay = Some(wav.clone());
+        halt_unit_audio(&mut None, &mut feed, &mut pending, &mut job, &mut autoplay, &wav, &tts);
+        assert!(pending.is_empty() && job.is_none() && feed.is_none() && autoplay.is_none());
     }
 
     #[test]
