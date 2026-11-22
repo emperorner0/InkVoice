@@ -23,8 +23,8 @@ similar), abbreviation-looking tokens not in any table, and tokens containing di
 that no rule settled.
 
 Number wording comes from inflect; without it the layer disables itself with one line
-on stderr and apply() marks every word "keep", so normalizer.py asks the LLM about
-everything, exactly as it did before this layer existed.
+on stderr and apply() marks every word "keep" unless the pronunciation table lists it,
+so normalizer.py does not ask the LLM either and only the table applies.
 
 The money, clock time, percent and abbreviation passes are adapted from
 Kokoro-FastAPI's Apache-2.0 api/src/services/text_processing/normalization/english.py

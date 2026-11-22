@@ -43,8 +43,9 @@ table's respelling or no change, so it acts as a sense check and cannot invent a
 
 With no server configured the rules still run: settled and default words are spoken in
 their rule form and flagged words are spoken as written. When `inflect` cannot be imported,
-the rule layer turns itself off with one line on the worker's stderr and the model, if one
-is configured, is asked about every word as before the rule layer existed. Nothing raises.
+the rule layer turns itself off with one line on the worker's stderr and the model is not
+asked either, even when a server is configured, so only your pronunciation table applies.
+Nothing raises.
 
 ## Your own pronunciations
 

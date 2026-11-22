@@ -1535,7 +1535,6 @@ fn install_workers() {
     }
 }
 
-/// .../books/<id>/audio/<profile>/c0001.wav -> id
 /// Audio files by the folder they are in and their unit key, whichever name form they have.
 type AudioKeys = HashMap<(PathBuf, (usize, Option<usize>)), PathBuf>;
 
@@ -1553,6 +1552,7 @@ fn note_audio(keys: &mut AudioKeys, p: &Path) {
     }
 }
 
+/// .../books/<id>/audio/<profile>/c0001.wav -> id
 fn book_id_of(p: &Path) -> Option<String> {
     Some(p.parent()?.parent()?.parent()?.file_name()?.to_string_lossy().into_owned())
 }

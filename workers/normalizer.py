@@ -11,7 +11,7 @@ network call, so with an empty url the rules run alone and flagged words are spo
 written. When a url is set and the piece contains at least one default or flagged word,
 the model is asked about exactly those words; a reply may change only them, and any
 change to another word is dropped in code. Without inflect the rule layer is off (one
-line on stderr) and the LLM is asked about every word, as before the layer existed.
+line on stderr) and the LLM is not asked either, so only the pronunciation table applies.
 
 Only opening quotes/brackets stay in front of a replacement and only sentence
 punctuation, closing quotes/brackets and dashes behind it, re-attached in code, and a
