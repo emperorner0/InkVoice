@@ -199,6 +199,9 @@ fn remove_in(name: &str, d: &Path) {
                     let _ = std::fs::remove_dir_all(e.path());
                 }
             }
+            if !installed_in("phonon", d) && hub_only_housekeeping(&d.join("hf").join("hub")) {
+                let _ = std::fs::remove_dir_all(d.join("hf"));
+            }
         }
         "phonon" => {
             // only the folders Phonon's warm-up fetched; the cache may hold other things
@@ -222,9 +225,13 @@ fn remove_in(name: &str, d: &Path) {
 }
 
 /// Whether the Hugging Face cache hub still holds anything but its own bookkeeping (`.locks`, …).
+/// The hub-wide `blobs` folder counts as bookkeeping: it holds the file contents of the model
+/// folders, so with no model folder left nothing uses it.
 fn hub_only_housekeeping(hub: &Path) -> bool {
-    std::fs::read_dir(hub).into_iter().flatten().flatten()
-        .all(|e| e.file_name().to_string_lossy().starts_with('.'))
+    std::fs::read_dir(hub).into_iter().flatten().flatten().all(|e| {
+        let n = e.file_name().to_string_lossy().into_owned();
+        n.starts_with('.') || n == "blobs" || n == "CACHEDIR.TAG"
+    })
 }
 
 #[derive(Clone)]
@@ -803,6 +810,32 @@ mod tests {
         assert!(!hub.join(super::WORD_TIMING_MODEL).exists());
         assert!(hub.join("models--gradium--phonon-31m-en").is_dir());
         assert!(super::installed_in("phonon", &d), "Phonon keeps working");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn qwen3_removal_alone_removes_the_shared_cache() {
+        let d = std::env::temp_dir().join(format!("inkvoice-remove-qwen3-alone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let hub = d.join("hf").join("hub");
+        // the layout Qwen3's huggingface_hub writes: file contents in a hub-wide blobs folder
+        for f in ["models--Qwen--Qwen3-TTS-12Hz-0.6B-Base", super::WORD_TIMING_MODEL, "blobs", ".locks"] {
+            std::fs::create_dir_all(hub.join(f)).unwrap();
+        }
+        std::fs::write(hub.join("blobs").join("weights"), b"x").unwrap();
+        std::fs::write(hub.join("CACHEDIR.TAG"), b"").unwrap();
+        fake_install(&d, "qwen3");
+        fake_install(&d, "kokoro");
+        super::remove_in("qwen3", &d);
+        assert!(!d.join("hf").exists(), "no installed engine uses the cache");
+        assert!(super::installed_in("kokoro", &d), "Kokoro keeps working");
+
+        for f in ["models--Qwen--Qwen3-TTS-12Hz-0.6B-Base", "models--other--thing", "blobs"] {
+            std::fs::create_dir_all(hub.join(f)).unwrap();
+        }
+        super::remove_in("qwen3", &d);
+        assert!(hub.join("models--other--thing").is_dir(), "a foreign folder keeps the cache");
+        assert!(hub.join("blobs").is_dir());
         let _ = std::fs::remove_dir_all(&d);
     }
 
