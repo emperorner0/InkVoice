@@ -55,7 +55,8 @@ Leftovers are files under a book's audio folder that no generation needs any mor
   writing them now
 - `*.part` files, the half-written temporary files of an interrupted generation
 - `*.json.estimated` files from older versions of the app
-- timing `*.json` files whose audio file is gone
+- timing `*.json` files whose audio file is gone, unless that audio is queued or being
+  generated now
 - audio files whose section the book no longer has, with their timing files
 
 The leftovers line and "Clean up" only cover these; nothing else is touched.

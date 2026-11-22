@@ -107,7 +107,9 @@ portable zip. Windows may show a SmartScreen warning because the app isn't code-
 
 On first start, open **Settings → Voice engines** and install a voice. InkVoice downloads everything it needs
 into its own folder — a private Python (≈ 285 MB, once) plus the engine you pick — so nothing is installed
-system-wide and no Python knowledge is needed. Remove engines there too.
+system-wide and no Python knowledge is needed. Remove engines there too; if some of an engine's files
+are in use and cannot be deleted, the app says so and keeps the Remove button, so close InkVoice, start
+it again and remove the engine once more.
 
 ### Build from source
 
