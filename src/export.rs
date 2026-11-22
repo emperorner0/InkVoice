@@ -348,6 +348,22 @@ pub fn free_name(path: &Path) -> PathBuf {
     unreachable!()
 }
 
+/// `free_name` for a folder: a folder name has no extension, so the counter goes after
+/// the whole name even when it contains a dot ("A. B. Carter - Title (2)").
+pub fn free_folder(path: &Path) -> PathBuf {
+    if !path.exists() {
+        return path.to_path_buf();
+    }
+    let name = path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    for i in 2.. {
+        let p = path.with_file_name(format!("{name} ({i})"));
+        if !p.exists() {
+            return p;
+        }
+    }
+    unreachable!()
+}
+
 /// The file stem of exported chapter `n` (from 1) of `total`: "03 - Title", with the
 /// width 100 or more exported chapters need.
 fn chapter_stem(n: usize, total: usize, title: &str) -> String {
@@ -379,7 +395,7 @@ pub fn run_wav(plan: &ExportPlan, cancel: &AtomicBool, prog: &mut dyn FnMut(f32,
     if plan.chapters.is_empty() {
         return Err(ExportErr::Msg("Nothing to export".into()));
     }
-    let folder = free_name(&plan.dest.join(book_name(&plan.title, &plan.author)));
+    let folder = free_folder(&plan.dest.join(book_name(&plan.title, &plan.author)));
     std::fs::create_dir(&folder).map_err(|e| ExportErr::Msg(format!("Cannot create {}: {e}", folder.display())))?;
     let n = plan.chapters.len();
     let mut done = 0;
@@ -749,7 +765,19 @@ mod tests {
         assert_eq!(free_name(&root.join("01 - A.wav")), root.join("01 - A (2).wav"));
         std::fs::write(root.join("01 - A (2).wav"), b"x").unwrap();
         assert_eq!(free_name(&root.join("01 - A.wav")), root.join("01 - A (3).wav"));
-        assert_eq!(free_name(&root.join("Quiet Harbor")), root.join("Quiet Harbor (2)"));
+        assert_eq!(free_folder(&root.join("Quiet Harbor")), root.join("Quiet Harbor (2)"));
+        // a folder name has no extension, so a dot in it does not move the counter
+        std::fs::create_dir(root.join("A. B. Carter - The Quiet Harbor")).unwrap();
+        assert_eq!(
+            free_folder(&root.join("A. B. Carter - The Quiet Harbor")),
+            root.join("A. B. Carter - The Quiet Harbor (2)")
+        );
+        std::fs::create_dir(root.join("A. B. Carter - The Quiet Harbor (2)")).unwrap();
+        assert_eq!(
+            free_folder(&root.join("A. B. Carter - The Quiet Harbor")),
+            root.join("A. B. Carter - The Quiet Harbor (3)")
+        );
+        assert_eq!(free_folder(&root.join("Mr. Fox")), root.join("Mr. Fox"));
         assert_eq!(free_name(&root.join("New one.wav")), root.join("New one.wav"));
         let _ = std::fs::remove_dir_all(&root);
     }
