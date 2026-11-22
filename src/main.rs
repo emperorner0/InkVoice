@@ -876,17 +876,22 @@ impl App {
             self.cancel_generation();
             self.tts.stop();
         }
-        installer::remove(name, self.install.is_none());
-        self.installed.remove(name);
+        let removal = installer::remove(name, self.install.is_none());
         self.confirm_uninstall = None;
-        if self.cfg.engine == name {
-            if let Some(e) = installer::SPECS.iter().find(|s| self.installed.contains(s.name)) {
-                self.cfg.engine = e.name.to_string();
-                self.worker_dirty = true;
-                self.apply_worker_settings();
+        if !removal.installed {
+            self.installed.remove(name);
+            if self.cfg.engine == name {
+                if let Some(e) = installer::SPECS.iter().find(|s| self.installed.contains(s.name)) {
+                    self.cfg.engine = e.name.to_string();
+                    self.worker_dirty = true;
+                    self.apply_worker_settings();
+                }
             }
         }
-        self.notify(format!("Removed {}", installer::spec(name).map_or(name, |s| s.title)));
+        match removal.notice(installer::spec(name).map_or(name, |s| s.title)) {
+            Ok(text) => self.notify(text),
+            Err(text) => self.notify_err(text),
+        }
     }
 
     fn poll_install(&mut self) {
@@ -1820,13 +1825,13 @@ fn migrate_audio_in(lib: &[Book], books: &Path) -> Vec<AudioMove> {
                 // comes back if the wav cannot follow
                 let json = p.with_extension("json");
                 let json_to = want.with_extension("json");
-                let paired = !json.exists() || (!json_to.exists() && std::fs::rename(&json, &json_to).is_ok());
-                if !paired {
+                let has_json = json.exists();
+                if has_json && (json_to.exists() || std::fs::rename(&json, &json_to).is_err()) {
                     left += 1;
                     continue;
                 }
                 if std::fs::rename(&p, &want).is_err() {
-                    if json.exists() {
+                    if has_json {
                         let _ = std::fs::rename(&json_to, &json);
                     }
                     left += 1;
@@ -1926,7 +1931,8 @@ fn scan_audio_in(b: &Book, audio: &Path) -> Vec<AudioItem> {
 /// Files under a book's audio folder that no generation owns any more: interrupted stream
 /// temp files, part-written files, estimated timings, timing files with no wav beside them,
 /// and audio whose key points at a section the book does not have (their timing files too).
-/// `busy` are the wav paths queued or being made right now; their temp files are left alone.
+/// `busy` are the wav paths queued or being made right now; their temp and timing files are
+/// left alone.
 fn scan_leftovers(b: &Book, busy: &HashSet<PathBuf>) -> Vec<JunkFile> {
     scan_leftovers_in(b, &b.dir().join("audio"), busy)
 }
@@ -1954,7 +1960,10 @@ fn scan_leftovers_in(b: &Book, audio: &Path, busy: &HashSet<PathBuf>) -> Vec<Jun
                 }
             } else if name.ends_with(".json.estimated") {
                 out.push(JunkFile { path: p.clone(), size: size(p) });
-            } else if p.extension().is_some_and(|e| e == "json") && !wavs.contains(&p.with_extension("wav")) {
+            } else if p.extension().is_some_and(|e| e == "json")
+                && !wavs.contains(&p.with_extension("wav"))
+                && !busy.contains(&p.with_extension("wav"))
+            {
                 out.push(JunkFile { path: p.clone(), size: size(p) });
             } else if p.extension().is_some_and(|e| e == "wav") {
                 // audio whose key points at a section the book does not have, with its timing
@@ -2264,6 +2273,43 @@ print(json.dumps(spoken_rules.apply(sys.argv[2:])))
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A wav that another program holds open cannot be renamed; its timing file has to stay
+    /// beside it under the old name, where the player looks for it.
+    #[test]
+    #[cfg(windows)]
+    fn audio_rename_keeps_the_timing_file_with_a_wav_that_cannot_move() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let root = std::env::temp_dir().join("inkvoice-test-migrate-audio-held");
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("books/quiet_harbor-9f6689e3/audio/phonon-everly");
+        std::fs::create_dir_all(&dir).unwrap();
+        let b = book::Book {
+            id: "quiet_harbor-9f6689e3".into(),
+            title: "Quiet Harbor".into(),
+            author: String::new(),
+            source: String::new(),
+            chapters: vec![book::Chapter::new("Title Page".into(), vec!["t".into()])],
+            pos: (0, 0),
+            opened: 0,
+            listen: None,
+        };
+        std::fs::write(dir.join("c0000.wav"), b"wav").unwrap();
+        std::fs::write(dir.join("c0000.json"), b"{}").unwrap();
+        let held = std::fs::OpenOptions::new().read(true).share_mode(0).open(dir.join("c0000.wav")).unwrap();
+
+        let moves = migrate_audio_in(std::slice::from_ref(&b), &root.join("books"));
+        assert_eq!((moves[0].renamed, moves[0].left), (0, 1));
+        assert!(dir.join("c0000.wav").exists() && dir.join("c0000.json").exists(), "the pair stayed together");
+        assert!(!dir.join("00_Title_Page_c0000.json").exists(), "the timing file came back");
+
+        // once the wav is free, the next start moves both
+        drop(held);
+        let again = migrate_audio_in(std::slice::from_ref(&b), &root.join("books"));
+        assert_eq!((again[0].renamed, again[0].left), (1, 0));
+        assert!(dir.join("00_Title_Page_c0000.wav").exists() && dir.join("00_Title_Page_c0000.json").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// Runs the start-up migration and classification against a copy of a real library:
     ///   MIGRATE_DIR=<folder> cargo test migrates_library_copy -- --ignored --nocapture
     /// <folder> holds data/ (the copied books) and config/; nothing outside it is touched.
@@ -2398,6 +2444,8 @@ print(json.dumps(spoken_rules.apply(sys.argv[2:])))
         // a stream of a running generation: not a leftover, its part file neither
         put(&v, "01_The_Quiet_Harbor_c0001.wav.stream.pcm", b"pcm");
         put(&v, "01_The_Quiet_Harbor_c0001.json.part", b"{}");
+        // a job that is finishing writes its timing file before its wav
+        put(&v, "01_The_Quiet_Harbor_c0001.json", b"{}");
         // an interrupted first generation: a stream temp with no wav at all
         put(&v, "c0001_p0000.wav.stream.pcm", b"pcm");
         // every other leftover kind
@@ -2423,6 +2471,10 @@ print(json.dumps(spoken_rules.apply(sys.argv[2:])))
         );
         assert!(!names.contains(&"00_Title_Page_c0000.wav".to_string()) && !names.contains(&"00_Title_Page_c0000.json".to_string()), "real audio stays");
         assert!(!names.contains(&"01_The_Quiet_Harbor_c0001.json.part".to_string()), "nor is the part file of a running generation");
+        assert!(!names.contains(&"01_The_Quiet_Harbor_c0001.json".to_string()), "nor the timing file its wav is about to join");
+        // once that job is over and left no wav, the same timing file is a leftover
+        let later: Vec<PathBuf> = scan_leftovers_in(&b, &audio, &HashSet::new()).into_iter().map(|j| j.path).collect();
+        assert!(later.contains(&v.join("01_The_Quiet_Harbor_c0001.json")));
         let _ = std::fs::remove_dir_all(audio.parent().unwrap());
     }
 

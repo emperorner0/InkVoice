@@ -179,9 +179,9 @@ fn installed_in(name: &str, d: &Path) -> bool {
 /// Qwen3 runs in its own environment, `venv-qwen3`, which is removed with it.
 /// `clear_cache` also empties the package download cache; pass false while an install is
 /// running, since that install is using it.
-pub fn remove(name: &str, clear_cache: bool) {
+pub fn remove(name: &str, clear_cache: bool) -> Removal {
     let d = data_dir();
-    remove_in(name, &d);
+    let clean = remove_in(name, &d, REMOVE_WAIT);
     if name == "phonon" {
         if let Some(py) = venv_python().to_str() {
             let _ = uv_cmd(&["pip", "uninstall", "--python", py, "ptts"]).output();
@@ -189,6 +189,46 @@ pub fn remove(name: &str, clear_cache: bool) {
     }
     if clear_cache {
         clear_download_cache(&d);
+    }
+    Removal { clean, installed: installed_in(name, &d) }
+}
+
+/// How long a removal keeps trying while a folder cannot be deleted. A voice worker that
+/// was just stopped holds its files for a moment longer on Windows.
+const REMOVE_WAIT: Duration = Duration::from_secs(3);
+const REMOVE_PAUSE: Duration = Duration::from_millis(50);
+
+/// What removing an engine left on disk.
+pub struct Removal {
+    /// none of the engine's folders are left
+    pub clean: bool,
+    /// the engine still counts as installed
+    pub installed: bool,
+}
+
+impl Removal {
+    /// The notice for the user: `Ok` when the engine is gone, `Err` when files stayed behind.
+    pub fn notice(&self, title: &str) -> Result<String, String> {
+        if self.clean && !self.installed {
+            Ok(format!("Removed {title}"))
+        } else {
+            Err(format!("Some files of {title} could not be removed. Close InkVoice and try again."))
+        }
+    }
+}
+
+/// Delete a folder, trying again until `until` while something still holds its files.
+/// Returns whether the folder is gone.
+fn remove_tree(p: &Path, until: Instant) -> bool {
+    loop {
+        let _ = std::fs::remove_dir_all(p);
+        if !p.exists() {
+            return true;
+        }
+        if Instant::now() >= until {
+            return false;
+        }
+        std::thread::sleep(REMOVE_PAUSE);
     }
 }
 
@@ -201,40 +241,40 @@ fn clear_download_cache(d: &Path) {
 /// The folder half of [`remove`] on a given data folder, so it can be tested on a temporary
 /// tree. In the Hugging Face cache `<data>/hf/hub` Qwen3 owns its `models--Qwen--*` folders
 /// and the word-timing model, Phonon the `models--gradium--*` folders; everything else there
-/// belongs to someone else and stays.
-fn remove_in(name: &str, d: &Path) {
+/// belongs to someone else and stays. A folder that cannot be deleted is tried again for
+/// up to `wait` in all; the result says whether every folder of the engine is gone.
+fn remove_in(name: &str, d: &Path, wait: Duration) -> bool {
+    let until = Instant::now() + wait;
+    let mut clean = true;
     match name {
         "qwen3" => {
-            let _ = std::fs::remove_dir_all(d.join("venv-qwen3"));
+            clean &= remove_tree(&d.join("venv-qwen3"), until);
             for e in std::fs::read_dir(d.join("hf").join("hub")).into_iter().flatten().flatten() {
                 let n = e.file_name().into_string().unwrap_or_default();
                 if n.starts_with("models--Qwen--") || n == WORD_TIMING_MODEL {
-                    let _ = std::fs::remove_dir_all(e.path());
+                    clean &= remove_tree(&e.path(), until);
                 }
             }
             if !installed_in("phonon", d) && hub_only_housekeeping(&d.join("hf").join("hub")) {
-                let _ = std::fs::remove_dir_all(d.join("hf"));
+                clean &= remove_tree(&d.join("hf"), until);
             }
         }
         "phonon" => {
             // only the folders Phonon's warm-up fetched; the cache may hold other things
             for e in std::fs::read_dir(d.join("hf").join("hub")).into_iter().flatten().flatten() {
                 if e.file_name().to_string_lossy().starts_with(PHONON_MODELS) {
-                    let _ = std::fs::remove_dir_all(e.path());
+                    clean &= remove_tree(&e.path(), until);
                 }
             }
             if !installed_in("qwen3", d) && hub_only_housekeeping(&d.join("hf").join("hub")) {
-                let _ = std::fs::remove_dir_all(d.join("hf"));
+                clean &= remove_tree(&d.join("hf"), until);
             }
         }
-        "kokoro" => {
-            let _ = std::fs::remove_dir_all(d.join("models").join("kokoro"));
-        }
-        "woof" => {
-            let _ = std::fs::remove_dir_all(d.join("models").join("woof"));
-        }
+        "kokoro" => clean = remove_tree(&d.join("models").join("kokoro"), until),
+        "woof" => clean = remove_tree(&d.join("models").join("woof"), until),
         _ => {}
     }
+    clean
 }
 
 /// Whether the Hugging Face cache hub still holds anything but its own bookkeeping (`.locks`, …).
@@ -778,7 +818,7 @@ mod tests {
             std::fs::create_dir_all(hub.join(f)).unwrap();
         }
         fake_install(&d, "qwen3");
-        super::remove_in("phonon", &d);
+        super::remove_in("phonon", &d, super::REMOVE_WAIT);
         assert!(!hub.join("models--gradium--phonon-31m-en").exists());
         assert!(!hub.join("models--gradium--phonon-voices").exists());
         assert!(hub.join("models--Qwen--Qwen3-TTS-12Hz-0.6B-Base").is_dir());
@@ -797,11 +837,11 @@ mod tests {
         let hub = d.join("hf").join("hub");
         std::fs::create_dir_all(hub.join("models--gradium--phonon-31m-en")).unwrap();
         std::fs::create_dir_all(hub.join(".locks")).unwrap();
-        super::remove_in("phonon", &d);
+        super::remove_in("phonon", &d, super::REMOVE_WAIT);
         assert!(!d.join("hf").exists(), "only bookkeeping was left");
         std::fs::create_dir_all(hub.join("models--gradium--phonon-voices")).unwrap();
         std::fs::create_dir_all(hub.join("models--other--thing")).unwrap();
-        super::remove_in("phonon", &d);
+        super::remove_in("phonon", &d, super::REMOVE_WAIT);
         assert!(hub.join("models--other--thing").is_dir(), "a foreign folder keeps the cache");
         assert!(d.join("hf").is_dir());
         let _ = std::fs::remove_dir_all(&d);
@@ -817,7 +857,7 @@ mod tests {
         std::fs::create_dir_all(hub.join("models--gradium--phonon-31m-en")).unwrap();
         fake_install(&d, "qwen3");
         fake_install(&d, "phonon");
-        super::remove_in("qwen3", &d);
+        assert!(super::remove_in("qwen3", &d, super::REMOVE_WAIT));
         assert!(!d.join("venv-qwen3").exists());
         assert!(!hub.join("models--Qwen--Qwen3-TTS-12Hz-0.6B-Base").exists());
         assert!(!hub.join(super::WORD_TIMING_MODEL).exists());
@@ -839,16 +879,68 @@ mod tests {
         std::fs::write(hub.join("CACHEDIR.TAG"), b"").unwrap();
         fake_install(&d, "qwen3");
         fake_install(&d, "kokoro");
-        super::remove_in("qwen3", &d);
+        super::remove_in("qwen3", &d, super::REMOVE_WAIT);
         assert!(!d.join("hf").exists(), "no installed engine uses the cache");
         assert!(super::installed_in("kokoro", &d), "Kokoro keeps working");
 
         for f in ["models--Qwen--Qwen3-TTS-12Hz-0.6B-Base", "models--other--thing", "blobs"] {
             std::fs::create_dir_all(hub.join(f)).unwrap();
         }
-        super::remove_in("qwen3", &d);
+        super::remove_in("qwen3", &d, super::REMOVE_WAIT);
         assert!(hub.join("models--other--thing").is_dir(), "a foreign folder keeps the cache");
         assert!(hub.join("blobs").is_dir());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Open a file the way a running worker holds its libraries: nobody else may delete it.
+    #[cfg(windows)]
+    fn hold(p: &std::path::Path) -> std::fs::File {
+        use std::os::windows::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new().read(true).share_mode(0).open(p).unwrap()
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn removal_waits_for_a_file_that_is_let_go() {
+        let d = std::env::temp_dir().join(format!("inkvoice-remove-retry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        fake_install(&d, "qwen3");
+        let lib = d.join("venv-qwen3").join("Lib").join("site-packages").join("faster_qwen3_tts").join("core.pyd");
+        std::fs::write(&lib, b"x").unwrap();
+        let held = hold(&lib);
+        let worker = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            drop(held);
+        });
+        let clean = super::remove_in("qwen3", &d, std::time::Duration::from_secs(10));
+        worker.join().unwrap();
+        assert!(clean, "the removal went through once the file was free");
+        assert!(!d.join("venv-qwen3").exists());
+        let r = super::Removal { clean, installed: super::installed_in("qwen3", &d) };
+        assert_eq!(r.notice("Qwen3"), Ok("Removed Qwen3".to_string()));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn removal_that_leaves_files_is_not_reported_as_removed() {
+        let d = std::env::temp_dir().join(format!("inkvoice-remove-held-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        fake_install(&d, "kokoro");
+        let model = d.join("models").join("kokoro").join("voices-v1.0.bin");
+        let held = hold(&model);
+        let t0 = std::time::Instant::now();
+        let clean = super::remove_in("kokoro", &d, std::time::Duration::from_millis(300));
+        assert!(!clean && model.exists(), "the held file is still there");
+        assert!(t0.elapsed() >= std::time::Duration::from_millis(300), "it kept trying for the whole wait");
+        assert!(t0.elapsed() < std::time::Duration::from_secs(5), "and then gave up");
+        let r = super::Removal { clean, installed: super::installed_in("kokoro", &d) };
+        assert!(r.notice("Kokoro").is_err_and(|t| t.contains("could not be removed")));
+        // an engine that still passes the installed check is not reported as removed either
+        assert!(super::Removal { clean: true, installed: true }.notice("Kokoro").is_err());
+        drop(held);
+        assert!(super::remove_in("kokoro", &d, super::REMOVE_WAIT));
+        assert!(!super::installed_in("kokoro", &d));
         let _ = std::fs::remove_dir_all(&d);
     }
 
