@@ -846,6 +846,7 @@ impl App {
 
     fn install_engine(&mut self, name: &str) {
         if self.install.is_none() {
+            self.confirm_uninstall = None;
             self.inst.plan.clear();
             self.inst.step = 0;
             self.inst.frac = 0.0;
