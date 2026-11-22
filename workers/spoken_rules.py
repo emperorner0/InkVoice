@@ -214,7 +214,16 @@ def apply(words, table=None):
     listed = [_listed(_core(w), table) if table else None for w in words]
     if _ENG is None:
         return [(SETTLED, s) if s else (KEEP, None) for s in listed]
-    return [(SETTLED, s) if s else _one(i, w, words) for i, (w, s) in enumerate(zip(words, listed))]
+    return [(SETTLED, s) if s else _safe(i, w, words) for i, (w, s) in enumerate(zip(words, listed))]
+
+
+def _safe(i, w, words):
+    """The rule outcome for one word; a word the rules fail on (inflect refuses numbers above
+    its largest named scale) is spoken as written."""
+    try:
+        return _one(i, w, words)
+    except Exception:
+        return (KEEP, None)
 
 
 def is_abbrev(word, nxt=""):

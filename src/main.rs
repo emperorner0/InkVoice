@@ -872,8 +872,9 @@ impl App {
     }
 
     fn uninstall_engine(&mut self, name: &str) {
-        if self.cfg.engine == name {
+        if self.cfg.engine == name || self.worker_dirty {
             self.cancel_generation();
+            self.tts.stop();
         }
         installer::remove(name, self.install.is_none());
         self.installed.remove(name);
@@ -2087,6 +2088,42 @@ fn main() -> eframe::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Runs the rule layer in python3 with a stand-in for the inflect package whose number
+    /// wording refuses large numbers, as the real one does above its largest named scale.
+    const RULES_PROBE: &str = r#"
+import json, sys, types
+class Engine:
+    def number_to_words(self, n, andword=""):
+        if n >= 10 ** 36:
+            raise ValueError("number out of range")
+        return {5: "five", 12: "twelve"}[n]
+fake = types.ModuleType("inflect")
+fake.engine = Engine
+sys.modules["inflect"] = fake
+sys.path.insert(0, sys.argv[1])
+import spoken_rules
+print(json.dumps(spoken_rules.apply(sys.argv[2:])))
+"#;
+
+    /// A number the wording library refuses is spoken as written; it does not fail the piece,
+    /// and the words around it still get their spoken forms.
+    #[test]
+    fn rule_layer_keeps_a_number_it_cannot_word() {
+        let huge = "1".repeat(40);
+        let grouped = format!("1{}", ",000".repeat(13));
+        let out = std::process::Command::new("python3")
+            .args(["-B", "-c", RULES_PROBE, concat!(env!("CARGO_MANIFEST_DIR"), "/workers")])
+            .args(["5%", &huge, &grouped, &format!("${huge}"), &format!("{huge}%"), "12%"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let got: Vec<(String, Option<String>)> = serde_json::from_slice(&out.stdout).unwrap();
+        let settled = |s: &str| ("settled".to_string(), Some(s.to_string()));
+        let keep = ("keep".to_string(), None);
+        assert_eq!(got, vec![settled("five percent"), keep.clone(), keep.clone(), keep.clone(), keep, settled("twelve percent")]);
+    }
+
     #[test]
     fn parses_audio_names() {
         assert_eq!(parse_unit_name("c0003"), Some((3, None)));

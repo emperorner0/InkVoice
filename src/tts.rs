@@ -152,6 +152,16 @@ impl Tts {
             let _ = c.kill();
         }
     }
+
+    /// Like `cancel`, but also wait until the worker process is gone, so that its files can
+    /// be deleted.
+    pub fn stop(&self) {
+        self.queue.0.lock().unwrap().jobs.clear();
+        if let Some(c) = self.child.lock().unwrap().as_mut() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
 }
 
 impl Drop for Tts {
@@ -332,5 +342,25 @@ for line in sys.stdin:
             }
         }
         assert_eq!(log, vec!["interrupted one", "started three", "done three"]);
+    }
+
+    /// Stopping returns only once the worker process has exited, and nothing queued starts
+    /// it again.
+    #[test]
+    fn stop_waits_for_the_worker_process() {
+        let tts = Tts::start(vec!["python3".into(), "-c".into(), FAKE.into()], None, eframe::egui::Context::default());
+        let next = |timeout: f32| tts.rx.recv_timeout(Duration::from_secs_f32(timeout)).ok();
+
+        tts.submit(job("one", None), false);
+        tts.submit(job("two", None), false);
+        assert!(matches!(next(5.0), Some(Event::Started(p)) if p == PathBuf::from("one")));
+        std::thread::sleep(Duration::from_millis(500)); // the process is up and busy with "one"
+        assert!(matches!(tts.child.lock().unwrap().as_mut().map(|c| c.try_wait()), Some(Ok(None))), "worker runs");
+
+        tts.stop();
+        let exited = tts.child.lock().unwrap().as_mut().is_none_or(|c| matches!(c.try_wait(), Ok(Some(_))));
+        assert!(exited, "the worker process is gone when stop returns");
+        assert!(matches!(next(5.0), Some(Event::Failed(p, _)) if p == PathBuf::from("one")));
+        assert!(next(1.0).is_none(), "the queued job was dropped, not started");
     }
 }
