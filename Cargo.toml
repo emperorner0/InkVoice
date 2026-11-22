@@ -1,10 +1,10 @@
 [package]
 name = "inkvoice"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 description = "Lightweight dark-mode ebook reader that turns EPUB/PDF books into audiobooks with on-device voices"
-repository = "https://github.com/sabeel111/InkVoice"
-homepage = "https://sabeel111.github.io/InkVoice/"
+repository = "https://github.com/emperorner0/InkVoice"
+homepage = "https://github.com/emperorner0/InkVoice"
 license = "MIT"
 
 [dependencies]
@@ -14,11 +14,13 @@ rodio = { version = "0.20", default-features = false, features = ["wav"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 dirs = "6"
-epub = "2"
+deunicode = "1"
+rbook = { version = "0.7", default-features = false, features = ["threadsafe"] }
 html2text = "0.14"
 pdf-extract = "0.9"
 anyhow = "1"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+trash = "5"
 
 [profile.release]
 opt-level = "s"

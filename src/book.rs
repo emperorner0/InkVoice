@@ -1,3 +1,4 @@
+use crate::sections::Kind;
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -9,6 +10,28 @@ const PDF_PAGES_PER_CHAPTER: usize = 10;
 pub struct Chapter {
     pub title: String,
     pub pages: Vec<String>,
+    /// structural label the source file gave this section, lowercase EPUB vocabulary
+    /// ("cover", "titlepage", "toc", "copyright-page", "bodymatter", ...; "nonlinear" for a
+    /// spine item marked linear="no"); None when the file says nothing
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub marker: Option<String>,
+    /// what the section is; None until the book has been classified
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<Kind>,
+    /// the reader's own choice to skip (true) or include (false) this section when listening;
+    /// None follows `kind`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip: Option<bool>,
+}
+
+impl Chapter {
+    pub fn new(title: String, pages: Vec<String>) -> Self {
+        Chapter { title, pages, marker: None, kind: None, skip: None }
+    }
+    /// Whether continuous listening and "Generate whole book" leave this section out.
+    pub fn skipped(&self) -> bool {
+        self.skip.unwrap_or_else(|| self.kind.is_some_and(Kind::skipped_by_default))
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -27,6 +50,19 @@ pub struct Book {
     /// unix seconds the book was last opened (progress.json)
     #[serde(skip, default)]
     pub opened: u64,
+    /// the word last heard, so listening resumes exactly there (progress.json)
+    #[serde(skip, default)]
+    pub listen: Option<Listen>,
+}
+
+/// Where listening stopped: the audio unit (chapter, or chapter + page in page mode) and the
+/// char offset of the spoken word inside that unit's text. Text offsets (not seconds) stay valid
+/// when the audio is regenerated or the voice changes.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct Listen {
+    pub ch: usize,
+    pub pg: Option<usize>,
+    pub chr: usize,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -34,6 +70,8 @@ struct Progress {
     ch: usize,
     pg: usize,
     opened: u64,
+    #[serde(default)]
+    listen: Option<Listen>,
 }
 
 pub fn now_secs() -> u64 {
@@ -41,13 +79,21 @@ pub fn now_secs() -> u64 {
 }
 
 /// Where books, audio, voice engines and their models live
-/// (~/.local/share/inkvoice on Linux, %LOCALAPPDATA%\\inkvoice on Windows).
+/// (~/.local/share/inkvoice on Linux, %LOCALAPPDATA%\inkvoice on Windows). On Windows the
+/// Known Folder API ignores LOCALAPPDATA, so INKVOICE_DATA is the only redirect that works
+/// everywhere; the worker processes read the same variable (workers/common.py).
 pub fn data_dir() -> PathBuf {
-    dirs::data_local_dir().unwrap_or_else(|| PathBuf::from(".")).join("inkvoice")
+    std::env::var_os("INKVOICE_DATA").map_or_else(
+        || dirs::data_local_dir().unwrap_or_else(|| PathBuf::from(".")).join("inkvoice"),
+        PathBuf::from,
+    )
 }
 
 pub fn config_dir() -> PathBuf {
-    dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("inkvoice")
+    std::env::var_os("INKVOICE_CONFIG").map_or_else(
+        || dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("inkvoice"),
+        PathBuf::from,
+    )
 }
 
 /// Early versions were called BookReader: move their data and settings over once.
@@ -68,6 +114,76 @@ pub fn migrate_legacy() {
 pub fn books_dir() -> PathBuf {
     data_dir().join("books")
 }
+
+// ---------------- ids and folder names ----------------
+
+/// 64-bit FNV-1a hash, written out so ids stay the same across Rust versions
+/// (`DefaultHasher` promises no such thing).
+pub fn fnv64a(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// `s` reduced to lowercase ASCII letters, digits and single underscores. Also the slug for
+/// book folder names: non-alphanumerics collapse to `_`, runs fold together, ends trimmed.
+pub fn ascii_slug(s: &str) -> String {
+    let mut out = String::new();
+    let mut was_us = false;
+    for c in deunicode::deunicode(s).chars() {
+        let c = c.to_ascii_lowercase();
+        if c.is_ascii_alphanumeric() {
+            out.push(c);
+            was_us = false;
+        } else if !was_us && !out.is_empty() {
+            out.push('_');
+            was_us = true;
+        }
+    }
+    while out.ends_with('_') {
+        out.pop();
+    }
+    out
+}
+
+/// The id scheme before short folder names: the imported file's stem, lowercased, with every
+/// non-alphanumeric character replaced by `_`. Both import and migration hash this same string,
+/// so a book imported fresh and one migrated from an old folder land on the same id.
+pub fn legacy_id(stem: &str) -> String {
+    stem.chars().map(|c| if c.is_alphanumeric() { c } else { '_' }).collect::<String>().to_lowercase()
+}
+
+/// Whether an id is already in the `<slug>-<8 hex>` form: a slug of at most 40 characters
+/// from `a-z 0-9 _`, a hyphen, exactly 8 lowercase hex digits. Never decided by hashing, so
+/// migration cannot repeat on a later start.
+pub fn is_new_id(id: &str) -> bool {
+    let Some((slug, hex)) = id.split_once('-') else { return false };
+    !slug.is_empty()
+        && slug.len() <= 40
+        && slug.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        && hex.len() == 8
+        && hex.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
+/// A book's folder name: `<slug>-<8 hex>` with the slug from the title (or the legacy id when
+/// there is no title), at most 40 characters, and the hex digits from the FNV-1a hash of the
+/// legacy id, so the same file always maps to the same short id.
+pub fn book_id(title: &str, legacy: &str) -> String {
+    let mut slug = {
+        let s = ascii_slug(title);
+        (!s.is_empty()).then_some(s).unwrap_or_else(|| ascii_slug(legacy))
+    };
+    slug.truncate(40); // ascii_slug is pure ASCII
+    while slug.ends_with('_') {
+        slug.pop();
+    }
+    let slug = if slug.is_empty() { "book".to_string() } else { slug };
+    format!("{slug}-{:08x}", fnv64a(legacy) as u32)
+}
+
 impl Book {
     pub fn dir(&self) -> PathBuf {
         books_dir().join(&self.id)
@@ -84,14 +200,15 @@ impl Book {
     fn load_progress(&mut self) {
         let bytes = std::fs::read(self.dir().join("progress.json")).unwrap_or_default();
         let p = serde_json::from_slice::<Progress>(&bytes)
-            .or_else(|_| serde_json::from_slice::<(usize, usize)>(&bytes).map(|(ch, pg)| Progress { ch, pg, opened: 0 }))
+            .or_else(|_| serde_json::from_slice::<(usize, usize)>(&bytes).map(|(ch, pg)| Progress { ch, pg, opened: 0, listen: None }))
             .unwrap_or_default();
         let valid = p.ch < self.chapters.len() && p.pg < self.chapters[p.ch].pages.len();
         self.pos = if valid { (p.ch, p.pg) } else { (0, 0) };
         self.opened = p.opened;
+        self.listen = p.listen.filter(|l| l.ch < self.chapters.len() && l.pg.map_or(true, |pg| pg < self.chapters[l.ch].pages.len()));
     }
     pub fn save_progress(&self) {
-        let p = Progress { ch: self.pos.0, pg: self.pos.1, opened: self.opened };
+        let p = Progress { ch: self.pos.0, pg: self.pos.1, opened: self.opened, listen: self.listen.clone() };
         let _ = std::fs::write(self.dir().join("progress.json"), serde_json::to_vec(&p).unwrap());
     }
     /// Fraction of pages before the current position.
@@ -118,19 +235,75 @@ impl Book {
 }
 
 pub fn load_library() -> Vec<Book> {
-    let mut v: Vec<Book> = std::fs::read_dir(books_dir())
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|e| std::fs::read(e.path().join("book.json")).ok())
-        .filter_map(|b| serde_json::from_slice::<Book>(&b).ok())
-        .map(|mut b| {
-            b.load_progress();
-            b
-        })
-        .collect();
+    let mut v: Vec<Book> = Vec::new();
+    let Ok(rd) = std::fs::read_dir(books_dir()) else { return v };
+    for e in rd.flatten() {
+        let Ok(bytes) = std::fs::read(e.path().join("book.json")) else { continue };
+        let Ok(mut b) = serde_json::from_slice::<Book>(&bytes) else { continue };
+        // the folder name is the truth: a half-finished move must not leave a book pointing
+        // at a folder that does not exist
+        if let Some(name) = e.file_name().to_str() {
+            if b.id != name {
+                b.id = name.to_string();
+                let _ = b.save();
+            }
+        }
+        // classify anything imported before sections had kinds, and keep the result
+        if crate::sections::classify(&mut b) {
+            let _ = b.save();
+        }
+        b.load_progress();
+        v.push(b);
+    }
     sort_library(&mut v);
     v
+}
+
+/// One-time move to short book folder names: every book whose id still has the old form has
+/// its folder renamed and its id rewritten; ids already in the new form are never touched
+/// again. When the target exists, or any step fails, the book is left exactly as it was.
+/// Returns the renames done as (from, to) folder names.
+pub fn migrate_library() -> Vec<(String, String)> {
+    migrate_library_in(&books_dir())
+}
+
+fn migrate_library_in(books: &Path) -> Vec<(String, String)> {
+    let mut done = Vec::new();
+    let Ok(rd) = std::fs::read_dir(books) else { return done };
+    for e in rd.flatten() {
+        let dir = e.path();
+        let Ok(bytes) = std::fs::read(dir.join("book.json")) else { continue };
+        let Ok(mut b) = serde_json::from_slice::<Book>(&bytes) else { continue };
+        if is_new_id(&b.id) {
+            continue; // already migrated; hashing the new id would drift on every start
+        }
+        // the stored old id is the legacy id the import once made from the file stem, so a
+        // fresh import of the same file lands on the same new id
+        b.id = book_id(&b.title, &b.id);
+        let Ok(new_bytes) = serde_json::to_vec(&b) else { continue };
+        let Some(from) = dir.file_name().and_then(|n| n.to_str()).map(String::from) else { continue };
+        let to = books.join(&b.id);
+        if to.exists() {
+            continue; // never overwrite
+        }
+        // crash-safe: the updated book.json sits inside the folder before it moves, and takes
+        // the old file's place after; a failure at any step restores what was
+        let tmp = dir.join("book.json.new");
+        if std::fs::write(&tmp, &new_bytes).is_err() {
+            continue;
+        }
+        if std::fs::rename(&dir, &to).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            continue;
+        }
+        if std::fs::rename(to.join("book.json.new"), to.join("book.json")).is_err() {
+            let _ = std::fs::rename(&to, &dir);
+            let _ = std::fs::remove_file(dir.join("book.json.new"));
+            continue;
+        }
+        done.push((from, b.id.clone()));
+    }
+    done
 }
 
 /// Most recently opened first, then by title.
@@ -147,14 +320,11 @@ pub fn import(path: &Path) -> Result<Book> {
         _ => bail!("Unsupported file type (use .epub or .pdf)"),
     };
     book.source = path.to_string_lossy().into_owned();
-    book.id = stem
-        .chars()
-        .map(|c| if c.is_alphanumeric() { c } else { '_' })
-        .collect::<String>()
-        .to_lowercase();
+    book.id = book_id(&book.title, &legacy_id(&stem));
     if book.chapters.is_empty() {
         bail!("No readable text found (scanned PDF?)");
     }
+    crate::sections::classify(&mut book);
     book.save()?;
     if let Some(bytes) = cover {
         // store a small thumbnail; a missing/odd cover is not an import error
@@ -167,31 +337,43 @@ pub fn import(path: &Path) -> Result<Book> {
 }
 
 fn import_epub(path: &Path, stem: &str) -> Result<(Book, Option<Vec<u8>>)> {
-    let mut doc = epub::doc::EpubDoc::new(path)?;
-    let title = doc.mdata("title").map(|m| m.value.trim().to_string()).unwrap_or_else(|| stem.to_string());
-    let author = doc.mdata("creator").map(|m| m.value.trim().to_string()).unwrap_or_default();
-    let cover = doc.get_cover().map(|(bytes, _mime)| bytes);
+    let doc = rbook::Epub::open(path)?;
+    let title = doc.metadata().title().map(|m| m.value().trim().to_string()).unwrap_or_else(|| stem.to_string());
+    let author = doc.metadata().creators().next().map(|m| m.value().trim().to_string()).unwrap_or_default();
+    let cover = doc.manifest().cover_image().and_then(|c| c.read_bytes().ok());
     // Prefer the book's own table of contents (real chapter titles, and chapters that share a
     // file are split at their anchors); fall back to one chapter per file.
-    let mut chapters = chapters_from_toc(&mut doc);
+    let mut chapters = chapters_from_toc(&doc);
     if chapters.len() < 2 {
-        chapters = chapters_from_spine(&mut doc);
+        chapters = chapters_from_spine(&doc);
     }
-    Ok((Book { id: String::new(), title, author, source: String::new(), chapters, pos: (0, 0), opened: 0 }, cover))
+    Ok((Book { id: String::new(), title, author, source: String::new(), chapters, pos: (0, 0), opened: 0, listen: None }, cover))
 }
 
 /// One chapter per spine file, titled from its first line.
-fn chapters_from_spine(doc: &mut epub::doc::EpubDoc<std::io::BufReader<std::fs::File>>) -> Vec<Chapter> {
+fn chapters_from_spine(doc: &rbook::Epub) -> Vec<Chapter> {
+    let marks = landmark_markers(doc);
     let mut chapters = Vec::new();
-    for i in 0..doc.spine.len() {
-        doc.set_current_chapter(i);
-        let Some((html, _)) = doc.get_current_str() else { continue };
+    for entry in doc.spine() {
+        let Some(m) = entry.manifest_entry() else { continue };
+        let Ok(html) = doc.read_resource_str(m.resource()) else { continue };
         let text = html_to_text(&html);
         if text.chars().count() < 80 {
             continue;
         }
+        // a landmark onto this file marks the chapter that starts at it, fragment or not
+        let file = m.href();
+        let marker = marks
+            .iter()
+            .find(|(f, fr, _)| f.as_str() == file.as_str() && fr.is_none())
+            .or_else(|| marks.iter().find(|(f, _, _)| f.as_str() == file.as_str()))
+            .map(|(_, _, k)| *k)
+            .or_else(|| body_marker(&html))
+            .or_else(|| (!entry.is_linear()).then_some("nonlinear"));
         let title = title_from_text(&text).unwrap_or_else(|| format!("Section {}", chapters.len() + 1));
-        chapters.push(Chapter { title, pages: paginate(&text) });
+        let mut ch = Chapter::new(title, paginate(&text));
+        ch.marker = marker.map(str::to_string);
+        chapters.push(ch);
     }
     chapters
 }
@@ -205,39 +387,34 @@ fn title_from_text(text: &str) -> Option<String> {
     (first.chars().count() <= 70).then(|| first.to_string())
 }
 
-fn chapters_from_toc(doc: &mut epub::doc::EpubDoc<std::io::BufReader<std::fs::File>>) -> Vec<Chapter> {
+fn chapters_from_toc(doc: &rbook::Epub) -> Vec<Chapter> {
     // flatten the TOC: (label, file, fragment)
-    fn flat(n: &[epub::doc::NavPoint], out: &mut Vec<(String, PathBuf, Option<String>)>) {
-        for p in n {
-            let s = p.content.to_string_lossy().into_owned();
-            let (file, frag) = match s.split_once('#') {
-                Some((f, fr)) => (PathBuf::from(f), Some(fr.to_string())),
-                None => (PathBuf::from(&s), None),
-            };
-            let label = p.label.split_whitespace().collect::<Vec<_>>().join(" ");
-            out.push((label, file, frag));
-            flat(&p.children, out);
+    let mut toc: Vec<(String, String, Option<String>)> = Vec::new();
+    if let Some(nav) = doc.toc().contents() {
+        for p in nav.flatten() {
+            let Some(href) = p.href() else { continue };
+            let label = p.label().split_whitespace().collect::<Vec<_>>().join(" ");
+            toc.push((label, href.path().as_str().to_string(), href.fragment().map(str::to_string)));
         }
     }
-    let mut toc = Vec::new();
-    let nav = doc.toc.clone();
-    flat(&nav, &mut toc);
     if toc.len() < 2 {
         return Vec::new();
     }
+    let marks = landmark_markers(doc);
 
-    // (title, text) in reading order; text before a file's first anchor continues the previous chapter
-    let mut parts: Vec<(String, String)> = Vec::new();
-    let spine: Vec<String> = doc.spine.iter().map(|s| s.idref.clone()).collect();
-    for idref in spine {
-        let Some(file) = doc.resources.get(&idref).map(|r| r.path.clone()) else { continue };
-        let Some(html) = doc.get_resource_str_by_path(&file) else { continue };
-        let mut cuts: Vec<(usize, String)> = toc
+    // (title, text, marker) in reading order; text before a file's first anchor continues the previous chapter
+    let mut parts: Vec<(String, String, Option<&'static str>)> = Vec::new();
+    for entry in doc.spine() {
+        let Some(m) = entry.manifest_entry() else { continue };
+        let Ok(html) = doc.read_resource_str(m.resource()) else { continue };
+        let file = m.href().as_str().to_string();
+        let doc_type = body_marker(&html);
+        let mut cuts: Vec<(usize, &str, Option<&str>)> = toc
             .iter()
-            .filter(|(_, f, _)| *f == file)
-            .filter_map(|(label, _, frag)| match frag {
-                None => Some((0, label.clone())),
-                Some(fr) => anchor_pos(&html, fr).map(|p| (p, label.clone())),
+            .filter(|(_, f, _)| f == &file)
+            .filter_map(|(label, _, frag)| match frag.as_deref() {
+                None => Some((0, label.as_str(), None)),
+                Some(fr) => anchor_pos(&html, fr).map(|p| (p, label.as_str(), Some(fr))),
             })
             .collect();
         cuts.sort_by_key(|c| c.0);
@@ -254,21 +431,39 @@ fn chapters_from_toc(doc: &mut epub::doc::EpubDoc<std::io::BufReader<std::fs::Fi
                         last.1.push_str("\n\n");
                         last.1.push_str(&text);
                     }
-                    None => parts.push((title_from_text(&text).unwrap_or_else(|| "Beginning".into()), text)),
+                    None => {
+                        let marker = marks
+                            .iter()
+                            .find(|(f, fr, _)| f == &file && fr.is_none())
+                            .map(|(_, _, k)| *k)
+                            .or(doc_type)
+                            .or((!entry.is_linear()).then_some("nonlinear"));
+                        parts.push((title_from_text(&text).unwrap_or_else(|| "Beginning".into()), text, marker));
+                    }
                 }
             }
         }
-        for (k, (start, label)) in cuts.iter().enumerate() {
+        for (k, (start, label, frag)) in cuts.iter().enumerate() {
             let text = html_to_text(&html[*start..bounds[k + 1]]);
-            parts.push((label.clone(), text));
+            let marker = marks
+                .iter()
+                .find(|(f, fr, _)| f == &file && fr.as_deref() == *frag)
+                .map(|(_, _, k)| *k)
+                .or(doc_type)
+                .or((!entry.is_linear()).then_some("nonlinear"));
+            parts.push((label.to_string(), text, marker));
         }
     }
     parts
         .into_iter()
-        .filter(|(_, t)| t.trim().chars().count() >= 20)
-        .map(|(title, text)| Chapter {
-            title: if title.is_empty() { "Untitled".into() } else { title.chars().take(80).collect() },
-            pages: paginate(text.trim()),
+        .filter(|(_, t, _)| t.trim().chars().count() >= 20)
+        .map(|(title, text, marker)| {
+            let mut ch = Chapter::new(
+                if title.is_empty() { "Untitled".into() } else { title.chars().take(80).collect() },
+                paginate(text.trim()),
+            );
+            ch.marker = marker.map(str::to_string);
+            ch
         })
         .collect()
 }
@@ -284,6 +479,79 @@ fn anchor_pos(html: &str, frag: &str) -> Option<usize> {
         }
     }
     None
+}
+
+/// Markers from the EPUB 3 landmarks nav or, failing that, the EPUB 2 OPF guide (rbook serves
+/// both as the "landmarks" group, the nav winning when both exist): (file, fragment, marker).
+fn landmark_markers(doc: &rbook::Epub) -> Vec<(String, Option<String>, &'static str)> {
+    let mut marks = Vec::new();
+    if let Some(root) = doc.toc().landmarks() {
+        for e in root.flatten() {
+            let marker = marker_term(e.kind_raw().unwrap_or_default());
+            if let (Some(href), Some(marker)) = (e.href(), marker) {
+                marks.push((href.path().as_str().to_string(), href.fragment().map(str::to_string), marker));
+            }
+        }
+    }
+    marks
+}
+
+/// Map a landmark/guide type or `epub:type` onto the marker vocabulary; None for other terms.
+fn marker_term(raw: &str) -> Option<&'static str> {
+    raw.split_whitespace().find_map(|t| {
+        Some(match t.to_ascii_lowercase().as_str() {
+            "cover" => "cover",
+            "titlepage" | "title-page" => "titlepage",
+            "toc" => "toc",
+            "copyright-page" | "copyright" => "copyright-page",
+            "dedication" => "dedication",
+            "epigraph" => "epigraph",
+            "foreword" => "foreword",
+            "preface" => "preface",
+            "introduction" => "introduction",
+            "acknowledgments" | "acknowledgements" => "acknowledgments",
+            "afterword" => "afterword",
+            "colophon" => "colophon",
+            "bibliography" => "bibliography",
+            "index" => "index",
+            "glossary" => "glossary",
+            "endnotes" | "notes" => "endnotes",
+            "frontmatter" => "frontmatter",
+            "bodymatter" | "text" => "bodymatter",
+            "backmatter" => "backmatter",
+            _ => return None,
+        })
+    })
+}
+
+/// `epub:type` on the `<body>`, else on the first sectioning element, when it names a section.
+fn body_marker(html: &str) -> Option<&'static str> {
+    let at = tag_pos(html, "body")
+        .or_else(|| ["article", "aside", "nav", "section"].iter().filter_map(|t| tag_pos(html, t)).min())?;
+    let end = at + html[at..].find('>')?;
+    attr_value(&html[at..end], "epub:type").and_then(marker_term)
+}
+
+/// Byte offset of `<tag`, when it is not the prefix of a longer tag name.
+fn tag_pos(html: &str, tag: &str) -> Option<usize> {
+    let needle = format!("<{tag}");
+    let mut from = 0;
+    while let Some(i) = html[from..].find(&needle) {
+        let at = from + i;
+        let after = html[at + needle.len()..].chars().next().unwrap_or(' ');
+        if !after.is_ascii_alphanumeric() {
+            return Some(at);
+        }
+        from = at + needle.len();
+    }
+    None
+}
+
+/// Value of a quoted attribute inside one tag.
+fn attr_value<'a>(tag: &'a str, attr: &str) -> Option<&'a str> {
+    let rest = tag.find(attr).map(|i| tag[i + attr.len()..].trim_start())?.strip_prefix('=')?.trim_start();
+    let q = rest.chars().next().filter(|c| *c == '"' || *c == '\'')?;
+    Some(&rest[1..1 + rest[1..].find(q)?])
 }
 
 fn html_to_text(html: &str) -> String {
@@ -317,13 +585,10 @@ fn import_pdf(path: &Path, stem: &str) -> Result<Book> {
         .enumerate()
         .map(|(i, c)| {
             let start = i * PDF_PAGES_PER_CHAPTER + 1;
-            Chapter {
-                title: format!("Pages {}-{}", start, start + c.len() - 1),
-                pages: c.to_vec(),
-            }
+            Chapter::new(format!("Pages {}-{}", start, start + c.len() - 1), c.to_vec())
         })
         .collect();
-    Ok(Book { id: String::new(), title: stem.to_string(), author: String::new(), source: String::new(), chapters, pos: (0, 0), opened: 0 })
+    Ok(Book { id: String::new(), title: stem.to_string(), author: String::new(), source: String::new(), chapters, pos: (0, 0), opened: 0, listen: None })
 }
 
 /// Split text into ~PAGE_CHARS pages on paragraph (then sentence/word) boundaries.
@@ -370,6 +635,18 @@ fn split_long(p: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    /// progress.json written by older versions (no listening position) still loads, and the
+    /// listening position round-trips.
+    #[test]
+    fn progress_keeps_listening_position() {
+        use super::{Listen, Progress};
+        let old: Progress = serde_json::from_str(r#"{"ch":3,"pg":1,"opened":7}"#).unwrap();
+        assert!(old.listen.is_none() && old.ch == 3 && old.pg == 1);
+        let p = Progress { ch: 2, pg: 0, opened: 1, listen: Some(Listen { ch: 2, pg: None, chr: 1234 }) };
+        let back: Progress = serde_json::from_slice(&serde_json::to_vec(&p).unwrap()).unwrap();
+        assert_eq!(back.listen, Some(Listen { ch: 2, pg: None, chr: 1234 }));
+    }
+
     #[test]
     fn imports_epub() {
         let Ok(p) = std::env::var("TEST_EPUB") else { return };
@@ -380,5 +657,124 @@ mod tests {
         assert!(b.chapters[0].pages.len() > 1);
         assert!(b.chapters[0].pages.iter().all(|p| p.chars().count() <= 2000));
         println!("{}", b.chapters[0].pages[0]);
+    }
+
+    #[test]
+    fn ids_are_short_and_stable() {
+        use super::{ascii_slug, book_id, fnv64a, is_new_id, legacy_id};
+        // FNV-1a 64-bit, pinned: the hash written out, not DefaultHasher
+        assert_eq!(fnv64a("the_salt_road"), 0x2742_642c_4525_57ac);
+        assert_eq!(legacy_id("Quiet Harbor - A. B. Carter"), "quiet_harbor___a__b__carter");
+        // a fresh import and an old library migrate to the same id
+        let stem = "The Ellis Family History - scanned 1911 copy";
+        let old = legacy_id(stem);
+        assert_eq!(book_id("The Ellis Family History", &old), "the_ellis_family_history-fbf52b90");
+        assert_eq!(book_id("Quiet Harbor", &legacy_id("Quiet Harbor - A. B. Carter")), "quiet_harbor-9f6689e3");
+        assert_eq!(book_id("", &legacy_id("A Long Way From Home")), "a_long_way_from_home-94f15b0e");
+        let long = book_id(
+            "The Complete and Utter History of Almost Everything Worth Mentioning",
+            &legacy_id("The Complete and Utter History of Almost Everything Worth Mentioning"),
+        );
+        assert_eq!(long, "the_complete_and_utter_history_of_almost-9805916d");
+        assert_eq!(long.len(), 49); // 40 slug + hyphen + 8 hex
+        assert!(is_new_id(&long) && is_new_id("a-00000000") && !is_new_id("quiet_harbor___a__b__carter_"));
+        assert!(!is_new_id("quiet-123456789")); // nine hex digits
+        assert!(!is_new_id("Quiet_Harbor-9f6689e3")); // capitals are not the written form
+        assert_eq!(ascii_slug("  Salt  &  Ember Fire "), "salt_ember_fire");
+    }
+
+    /// A library tree built in a scratch folder: an old long-id book, a book already in the
+    /// new form, and one whose target name is taken. Migration renames the first once,
+    /// leaves the others alone, and a second run does nothing.
+    #[test]
+    fn migrates_book_folders() {
+        use super::{book_id, is_new_id, legacy_id, migrate_library_in, Book, Chapter};
+        let root = std::env::temp_dir().join("inkvoice-test-migrate-folders");
+        let _ = std::fs::remove_dir_all(&root);
+        let books = root.join("books");
+        let mk = |id: &str, title: &str| {
+            let dir = books.join(id);
+            std::fs::create_dir_all(dir.join("audio/phonon-everly")).unwrap();
+            let b = Book {
+                id: id.into(),
+                title: title.into(),
+                author: String::new(),
+                source: String::new(),
+                chapters: vec![Chapter::new("One".into(), vec!["text one".into(), "text two".into()])],
+                pos: (0, 0),
+                opened: 0,
+                listen: None,
+            };
+            std::fs::write(dir.join("book.json"), serde_json::to_vec(&b).unwrap()).unwrap();
+            std::fs::write(dir.join("progress.json"), r#"{"ch":0,"pg":1,"opened":9}"#).unwrap();
+            std::fs::write(dir.join("audio/phonon-everly/c0000.wav"), b"wav").unwrap();
+        };
+        let stem = "the_ellis_family_history_and_their_many_relations_in_the_north_1902_second_edition";
+        mk(stem, "The Ellis Family History"); // an old long id
+        let settled = book_id("Winter Cars", "winter_cars");
+        mk(&settled, "Winter Cars"); // already migrated
+        mk("tide_charts", "Tide Charts");
+        // the target folder for "tide_charts" is taken by a book with the same title
+        mk(&book_id("Tide Charts", "tide_charts"), "Tide Charts");
+
+        let done = migrate_library_in(&books);
+        assert_eq!(done.len(), 1);
+        let want = book_id("The Ellis Family History", stem);
+        assert_eq!(done[0], (stem.to_string(), want.clone()));
+        assert!(books.join(&want).is_dir(), "folder renamed");
+        assert!(!books.join(stem).exists(), "old folder gone");
+        let moved: Book = serde_json::from_slice(&std::fs::read(books.join(&want).join("book.json")).unwrap()).unwrap();
+        assert_eq!(moved.id, want);
+        assert!(is_new_id(&moved.id));
+        assert_eq!(std::fs::read_to_string(books.join(&want).join("progress.json")).unwrap(), r#"{"ch":0,"pg":1,"opened":9}"#);
+        assert!(books.join(&want).join("audio/phonon-everly/c0000.wav").exists(), "audio came along");
+        // the taken target and the settled book are untouched
+        assert!(books.join("tide_charts").is_dir());
+        assert!(books.join(&book_id("Tide Charts", "tide_charts")).is_dir());
+        assert!(books.join(&settled).is_dir());
+        // a fresh import of the same file lands on the same id as the migrated book
+        let stem_words = "The Ellis Family History and their many relations in the north 1902 second edition";
+        assert_eq!(book_id("The Ellis Family History", &legacy_id(stem_words)), want);
+
+        // the second run renames nothing
+        assert!(migrate_library_in(&books).is_empty());
+        assert!(migrate_library_in(&books).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn imports_epub2_guide_fixture() {
+        let (b, _) = super::import_epub(std::path::Path::new("tests/fixtures/epub2-guide.epub"), "x").unwrap();
+        assert_eq!(b.title, "The Tide Clock");
+        assert_eq!(b.author, "Adela Marsh");
+        let titles: Vec<&str> = b.chapters.iter().map(|c| c.title.as_str()).collect();
+        assert_eq!(titles, ["Cover", "Title Page", "Contents", "Chapter One", "Chapter Two"]);
+        // guide reference types mapped onto the marker vocabulary; Chapter Two starts
+        // mid-file where no guide entry points, so it carries no marker
+        let markers: Vec<Option<&str>> = b.chapters.iter().map(|c| c.marker.as_deref()).collect();
+        assert_eq!(markers, [Some("cover"), Some("titlepage"), Some("toc"), Some("bodymatter"), None]);
+        // the anchor split: each side of the shared file lands in its own chapter
+        let one = b.chapter_text(3);
+        assert!(one.contains("Maren inherited the clock"));
+        assert!(!one.contains("winter visitor"));
+        let two = b.chapter_text(4);
+        assert!(two.contains("winter visitor"));
+        assert!(!two.contains("Maren inherited the clock"));
+        // text before the first anchor of the shared file continues the previous chapter
+        assert!(b.chapter_text(2).contains("The harbour keeps its own hours"));
+    }
+
+    #[test]
+    fn imports_epub3_landmarks_fixture() {
+        let (b, _) = super::import_epub(std::path::Path::new("tests/fixtures/epub3-landmarks.epub"), "x").unwrap();
+        assert_eq!(b.title, "Signal Hill");
+        let titles: Vec<&str> = b.chapters.iter().map(|c| c.title.as_str()).collect();
+        assert_eq!(titles, ["Cover", "Dedication", "First Part", "Sidebar Notes"]);
+        // cover and bodymatter from the landmarks nav, dedication from epub:type on the
+        // body, the non-linear spine item from its linear="no"
+        let markers: Vec<Option<&str>> = b.chapters.iter().map(|c| c.marker.as_deref()).collect();
+        assert_eq!(markers, [Some("cover"), Some("dedication"), Some("bodymatter"), Some("nonlinear")]);
+        assert!(b.chapter_text(2).contains("blinked in threes"));
+        assert!(b.chapter_text(3).contains("how many lamps"));
     }
 }

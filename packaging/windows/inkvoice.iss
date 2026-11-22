@@ -9,7 +9,7 @@ AppId={{8C1F2A7E-6B9D-4E3A-9F21-3D5B7A1C4E90}
 AppName=InkVoice
 AppVersion={#AppVersion}
 AppPublisher=InkVoice
-AppPublisherURL=https://github.com/sabeel111/InkVoice
+AppPublisherURL=https://github.com/emperorner0/InkVoice
 DefaultDirName={localappdata}\Programs\InkVoice
 DisableProgramGroupPage=yes
 DisableDirPage=yes
@@ -38,11 +38,8 @@ Source: "..\..\target\release\inkvoice.exe"; DestDir: "{app}"; DestName: "InkVoi
 Name: "{autoprograms}\InkVoice"; Filename: "{app}\InkVoice.exe"
 Name: "{autodesktop}\InkVoice"; Filename: "{app}\InkVoice.exe"; Tasks: desktopicon
 
-[Run]
-Filename: "{app}\InkVoice.exe"; Description: "Start InkVoice"; Flags: nowait postinstall skipifsilent
-
 [Messages]
 WelcomeLabel1=Welcome to InkVoice
 WelcomeLabel2=InkVoice is a calm, dark-mode reader that turns your EPUB and PDF books into audiobooks — with voices that run right here on your computer.%n%nInstalling takes a few seconds and needs no admin rights.
 FinishedHeadingLabel=InkVoice is installed
-FinishedLabel=Open InkVoice, import a book, and pick a voice in Settings → Voice engines. Happy reading (and listening)!
+FinishedLabel=Open InkVoice from the Start menu, import a book, and pick a voice in Settings → Voice engines. Happy reading (and listening)!

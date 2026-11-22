@@ -15,6 +15,12 @@ use std::time::{Duration, Instant};
 const UV_VERSION: &str = "0.13.7";
 const PYTHON: &str = "3.12";
 
+/// Folder in the Hugging Face cache that holds the word-timing model Qwen3 fetches at warm-up.
+const WORD_TIMING_MODEL: &str = "models--facebook--wav2vec2-base-960h";
+
+/// Prefix of the model folders Phonon's warm-up fetches into the Hugging Face cache.
+const PHONON_MODELS: &str = "models--gradium--";
+
 pub struct Spec {
     pub name: &'static str,
     pub title: &'static str,
@@ -23,6 +29,12 @@ pub struct Spec {
     pub license: &'static str,
     /// Python packages
     pip: &'static [&'static str],
+    /// extra `uv pip install` options (e.g. picking the CUDA build of PyTorch)
+    pip_opts: &'static [&'static str],
+    /// folder (inside the data folder) of the Python environment the engine runs in
+    venv: &'static str,
+    /// folder inside the data folder that must exist once the model has been fetched
+    probe_dir: Option<&'static str>,
     /// package folder that proves the packages are installed
     probe_pkg: &'static str,
     /// (url, path inside the data folder)
@@ -47,7 +59,10 @@ pub const SPECS: &[Spec] = &[
         blurb: "Clear, natural narration. 28 English voices (US & UK). Recommended.",
         size: "115 MB",
         license: "Apache-2.0",
-        pip: &["kokoro-onnx", "numpy"],
+        pip: &["kokoro-onnx", "inflect", "numpy"],
+        pip_opts: &[],
+        venv: "venv",
+        probe_dir: None,
         probe_pkg: "kokoro_onnx",
         files: &[
             (concat!("https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/", "kokoro-v1.0.int8.onnx"), "models/kokoro/kokoro-v1.0.int8.onnx"),
@@ -63,7 +78,10 @@ pub const SPECS: &[Spec] = &[
         blurb: "Fast and light (31M). 24 English voices.",
         size: "125 MB",
         license: "Apache-2.0",
-        pip: &["ptts", "numpy"],
+        pip: &["ptts", "inflect", "numpy"],
+        pip_opts: &[],
+        venv: "venv",
+        probe_dir: None,
         probe_pkg: "ptts",
         files: &[],
         warmup: Some("import ptts; ptts.TTS(lang='en', voice='Everly'); print('ready')"),
@@ -76,7 +94,10 @@ pub const SPECS: &[Spec] = &[
         blurb: "Tiny (32 MB) and lively. 2 voices. Free for non-commercial use only.",
         size: "41 MB",
         license: "Non-commercial",
-        pip: &["numpy"],
+        pip: &["inflect", "numpy"],
+        pip_opts: &[],
+        venv: "venv",
+        probe_dir: None,
         probe_pkg: "numpy",
         files: &[
             woof!("woof_int8.npz"),
@@ -94,18 +115,42 @@ pub const SPECS: &[Spec] = &[
         pip_mb: 16.0,
         warmup_mb: 0.0,
     },
+    Spec {
+        name: "qwen3",
+        title: "Qwen3 (cloned voice)",
+        blurb: "Expressive narration in a custom voice cloned from a short sample. Needs an NVIDIA GPU (about 3 GB of GPU memory).",
+        size: "7 GB",
+        license: "Apache-2.0",
+        // transformers is pinned: faster-qwen3-tts 0.5.4 fails to load its models on 5.23
+        pip: &["torch", "torchaudio", "faster-qwen3-tts==0.5.4", "transformers==5.15.1", "soundfile", "inflect", "numpy"],
+        pip_opts: &["--torch-backend", "auto"],
+        venv: "venv-qwen3",
+        probe_dir: Some("hf/hub/models--Qwen--Qwen3-TTS-12Hz-0.6B-Base"),
+        probe_pkg: "faster_qwen3_tts",
+        files: &[],
+        warmup: Some("from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-TTS-12Hz-0.6B-Base'); snapshot_download('facebook/wav2vec2-base-960h', allow_patterns=['*.json', '*.txt', 'model.safetensors']); print('ready')"),
+        pip_mb: 4500.0,
+        warmup_mb: 2500.0,
+    },
 ];
 pub fn spec(name: &str) -> Option<&'static Spec> {
     SPECS.iter().find(|s| s.name == name)
 }
 
 pub fn venv_python() -> PathBuf {
-    let v = data_dir().join("venv");
+    python_in("venv")
+}
+
+/// The Python of one of InkVoice's environments (`venv` is a folder inside the data folder).
+pub fn python_in(venv: &str) -> PathBuf {
+    python_in_venv(&data_dir().join(venv))
+}
+
+fn python_in_venv(v: &Path) -> PathBuf {
     if cfg!(windows) { v.join("Scripts").join("python.exe") } else { v.join("bin").join("python") }
 }
 
-fn site_packages() -> Vec<PathBuf> {
-    let v = data_dir().join("venv");
+fn site_packages_in(v: &Path) -> Vec<PathBuf> {
     let mut out = vec![v.join("Lib").join("site-packages")];
     if let Ok(rd) = std::fs::read_dir(v.join("lib")) {
         out.extend(rd.flatten().map(|e| e.path().join("site-packages")));
@@ -114,34 +159,154 @@ fn site_packages() -> Vec<PathBuf> {
 }
 
 pub fn is_installed(name: &str) -> bool {
+    installed_in(name, &data_dir())
+}
+
+/// [`is_installed`] against a given data folder, so removal can be tested on a temporary tree.
+fn installed_in(name: &str, d: &Path) -> bool {
     let Some(s) = spec(name) else { return false };
     // engines that fetch weights at warm-up keep them in <data>/hf
-    if s.warmup.is_some() && !data_dir().join("hf").is_dir() {
+    if s.warmup.is_some() && !d.join(s.probe_dir.unwrap_or("hf")).is_dir() {
         return false;
     }
-    venv_python().exists()
-        && site_packages().iter().any(|sp| sp.join(s.probe_pkg).is_dir())
-        && s.files.iter().all(|(_, rel)| data_dir().join(rel).is_file())
+    let venv = d.join(s.venv);
+    python_in_venv(&venv).exists()
+        && site_packages_in(&venv).iter().any(|sp| sp.join(s.probe_pkg).is_dir())
+        && s.files.iter().all(|(_, rel)| d.join(rel).is_file())
 }
 
 /// Remove an engine's model files (the shared Python environment stays; it is small).
-pub fn remove(name: &str) {
+/// Qwen3 runs in its own environment, `venv-qwen3`, which is removed with it.
+/// `clear_cache` also empties the package download cache; pass false while an install is
+/// running, since that install is using it.
+pub fn remove(name: &str, clear_cache: bool) -> Removal {
     let d = data_dir();
-    match name {
-        "phonon" => {
-            let _ = std::fs::remove_dir_all(d.join("hf"));
-            if let Some(py) = venv_python().to_str() {
-                let _ = uv_cmd(&["pip", "uninstall", "--python", py, "ptts"]).output();
-            }
+    let clean = remove_in(name, &d, REMOVE_WAIT);
+    if name == "phonon" {
+        if let Some(py) = venv_python().to_str() {
+            let _ = uv_cmd(&["pip", "uninstall", "--python", py, "ptts"]).output();
         }
-        "kokoro" => {
-            let _ = std::fs::remove_dir_all(d.join("models").join("kokoro"));
-        }
-        "woof" => {
-            let _ = std::fs::remove_dir_all(d.join("models").join("woof"));
-        }
-        _ => {}
     }
+    if clear_cache {
+        clear_download_cache(&d);
+    }
+    Removal { clean, installed: installed_in(name, &d) }
+}
+
+/// How long a removal keeps trying while a folder cannot be deleted. A voice worker that
+/// was just stopped holds its files for a moment longer on Windows.
+const REMOVE_WAIT: Duration = Duration::from_secs(3);
+const REMOVE_PAUSE: Duration = Duration::from_millis(50);
+
+/// What removing an engine left on disk.
+pub struct Removal {
+    /// none of the engine's folders are left
+    pub clean: bool,
+    /// the engine still counts as installed
+    pub installed: bool,
+}
+
+impl Removal {
+    /// The notice for the user: `Ok` when the engine is gone, `Err` when files stayed behind.
+    pub fn notice(&self, title: &str) -> Result<String, String> {
+        if self.clean && !self.installed {
+            Ok(format!("Removed {title}"))
+        } else {
+            Err(format!("Some files of {title} could not be removed. Close InkVoice and try again."))
+        }
+    }
+}
+
+/// Delete a folder, trying again until `until` while something still holds its files.
+/// Returns whether the folder is gone.
+fn remove_tree(p: &Path, until: Instant) -> bool {
+    loop {
+        let _ = std::fs::remove_dir_all(p);
+        if !p.exists() {
+            return true;
+        }
+        if Instant::now() >= until {
+            return false;
+        }
+        std::thread::sleep(REMOVE_PAUSE);
+    }
+}
+
+/// Empty the cache of packages downloaded for installs (several GB after a Qwen3 install).
+/// Installed engines keep their own copies, so this only costs a download on the next install.
+fn clear_download_cache(d: &Path) {
+    let _ = std::fs::remove_dir_all(d.join("cache").join("uv"));
+}
+
+/// The folder half of [`remove`] on a given data folder, so it can be tested on a temporary
+/// tree. In the Hugging Face cache `<data>/hf/hub` Qwen3 owns its `models--Qwen--*` folders
+/// and the word-timing model, Phonon the `models--gradium--*` folders; everything else there
+/// belongs to someone else and stays. A folder that cannot be deleted is tried again for
+/// up to `wait` in all; the result says whether every folder of the engine is gone.
+fn remove_in(name: &str, d: &Path, wait: Duration) -> bool {
+    let until = Instant::now() + wait;
+    let mut clean = true;
+    for p in own_folders(name, d) {
+        clean &= remove_tree(&p, until);
+    }
+    // the other engine that keeps models in the Hugging Face cache
+    let sharer = match name {
+        "qwen3" => "phonon",
+        "phonon" => "qwen3",
+        _ => return clean,
+    };
+    if !installed_in(sharer, d) && hub_only_housekeeping(&d.join("hf").join("hub")) {
+        clean &= remove_tree(&d.join("hf"), until);
+    }
+    clean
+}
+
+/// The folders on disk that belong to one engine alone: what removing it deletes.
+fn own_folders(name: &str, d: &Path) -> Vec<PathBuf> {
+    let hub = |mine: &dyn Fn(&str) -> bool| -> Vec<PathBuf> {
+        std::fs::read_dir(d.join("hf").join("hub"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| mine(&e.file_name().to_string_lossy()))
+            .map(|e| e.path())
+            .collect()
+    };
+    let mut out = match name {
+        "qwen3" => {
+            let mut v = vec![d.join("venv-qwen3")];
+            v.extend(hub(&|n| n.starts_with("models--Qwen--") || n == WORD_TIMING_MODEL));
+            v
+        }
+        // only the folders Phonon's warm-up fetched; the cache may hold other things
+        "phonon" => hub(&|n| n.starts_with(PHONON_MODELS)),
+        "kokoro" => vec![d.join("models").join("kokoro")],
+        "woof" => vec![d.join("models").join("woof")],
+        _ => Vec::new(),
+    };
+    out.retain(|p| p.exists());
+    out
+}
+
+/// Whether an engine that is not installed still has folders of its own on disk, as after
+/// a removal that could not delete everything. Such an engine can still be removed.
+pub fn has_leftovers(name: &str) -> bool {
+    leftovers_in(name, &data_dir())
+}
+
+/// [`has_leftovers`] against a given data folder, so it can be tested on a temporary tree.
+fn leftovers_in(name: &str, d: &Path) -> bool {
+    !installed_in(name, d) && !own_folders(name, d).is_empty()
+}
+
+/// Whether the Hugging Face cache hub still holds anything but its own bookkeeping (`.locks`, …).
+/// The hub-wide `blobs` folder counts as bookkeeping: it holds the file contents of the model
+/// folders, so with no model folder left nothing uses it.
+fn hub_only_housekeeping(hub: &Path) -> bool {
+    std::fs::read_dir(hub).into_iter().flatten().flatten().all(|e| {
+        let n = e.file_name().to_string_lossy().into_owned();
+        n.starts_with('.') || n == "blobs" || n == "CACHEDIR.TAG"
+    })
 }
 
 #[derive(Clone)]
@@ -249,9 +414,11 @@ fn cleanup_partial() {
     let d = data_dir();
     walk(&d.join("models"));
     walk(&d.join("tools"));
-    let venv = d.join("venv");
-    if venv.is_dir() && !venv_python().exists() {
-        let _ = std::fs::remove_dir_all(venv);
+    for s in SPECS {
+        let venv = d.join(s.venv);
+        if venv.is_dir() && !python_in(s.venv).exists() {
+            let _ = std::fs::remove_dir_all(venv);
+        }
     }
 }
 
@@ -273,7 +440,7 @@ fn run(name: &str, ctl: &mut Ctl) -> Result<(), String> {
     if !uv_path().exists() {
         plan.push((StepInfo { label: "Download the installer tool (uv)".into(), weight: 18.0 }, Task::Uv));
     }
-    if !venv_python().exists() {
+    if !python_in(s.venv).exists() {
         plan.push((StepInfo { label: "Set up a private Python".into(), weight: 33.0 }, Task::Python));
     }
     plan.push((StepInfo { label: format!("Install {} software", s.title), weight: s.pip_mb }, Task::Packages));
@@ -301,18 +468,19 @@ fn run(name: &str, ctl: &mut Ctl) -> Result<(), String> {
         match task {
             Task::Uv => get_uv(ctl)?,
             Task::Python => {
-                let venv = d.join("venv");
+                let venv = d.join(s.venv);
                 run_uv(uv_cmd(&["venv", "--python", PYTHON, venv.to_str().unwrap()]), ctl)?;
             }
             Task::Packages => {
-                let py = venv_python();
+                let py = python_in(s.venv);
                 let mut args = vec!["pip", "install", "--python", py.to_str().unwrap()];
+                args.extend(s.pip_opts);
                 args.extend(s.pip);
                 run_uv(uv_cmd(&args), ctl)?;
             }
             Task::Files(files) => download_all(&files, ctl)?,
             Task::Warmup => {
-                let mut c = Command::new(venv_python());
+                let mut c = Command::new(python_in(s.venv));
                 c.args(["-c", s.warmup.unwrap()]).env("HF_HOME", d.join("hf")).env("INKVOICE_DATA", &d);
                 run_watching_dir(c, &d.join("hf"), s.warmup_mb * 1e6, ctl)?;
             }
@@ -645,6 +813,212 @@ mod tests {
     fn parses_uv_sizes() {
         assert!((super::parse_size("16.0MiB") - 16.777).abs() < 0.01);
         assert!((super::parse_size("512KiB") - 0.524).abs() < 0.01);
+    }
+
+    /// Lay out the folders `installed_in` probes for, without installing anything.
+    fn fake_install(d: &std::path::Path, name: &str) {
+        let s = super::spec(name).unwrap();
+        std::fs::create_dir_all(d.join(s.probe_dir.unwrap_or("hf"))).unwrap();
+        let py = super::python_in_venv(&d.join(s.venv));
+        std::fs::create_dir_all(py.parent().unwrap()).unwrap();
+        std::fs::write(py, b"").unwrap();
+        std::fs::create_dir_all(d.join(s.venv).join("Lib").join("site-packages").join(s.probe_pkg)).unwrap();
+        for (_, rel) in s.files {
+            std::fs::create_dir_all(d.join(rel).parent().unwrap()).unwrap();
+            std::fs::write(d.join(rel), b"").unwrap();
+        }
+    }
+
+    #[test]
+    fn phonon_removal_keeps_what_it_does_not_own() {
+        let d = std::env::temp_dir().join(format!("inkvoice-remove-phonon-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let hub = d.join("hf").join("hub");
+        for f in ["models--gradium--phonon-31m-en", "models--gradium--phonon-voices",
+                  "models--Qwen--Qwen3-TTS-12Hz-0.6B-Base", super::WORD_TIMING_MODEL,
+                  "models--other--thing", ".locks"] {
+            std::fs::create_dir_all(hub.join(f)).unwrap();
+        }
+        fake_install(&d, "qwen3");
+        super::remove_in("phonon", &d, super::REMOVE_WAIT);
+        assert!(!hub.join("models--gradium--phonon-31m-en").exists());
+        assert!(!hub.join("models--gradium--phonon-voices").exists());
+        assert!(hub.join("models--Qwen--Qwen3-TTS-12Hz-0.6B-Base").is_dir());
+        assert!(hub.join(super::WORD_TIMING_MODEL).is_dir());
+        assert!(hub.join("models--other--thing").is_dir());
+        assert!(hub.join(".locks").is_dir());
+        assert!(d.join("hf").is_dir(), "Qwen3 still needs the cache");
+        assert!(d.join("venv-qwen3").is_dir(), "Qwen3's Python environment stays");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn phonon_removal_without_qwen3_removes_the_whole_cache() {
+        let d = std::env::temp_dir().join(format!("inkvoice-remove-phonon-alone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let hub = d.join("hf").join("hub");
+        std::fs::create_dir_all(hub.join("models--gradium--phonon-31m-en")).unwrap();
+        std::fs::create_dir_all(hub.join(".locks")).unwrap();
+        super::remove_in("phonon", &d, super::REMOVE_WAIT);
+        assert!(!d.join("hf").exists(), "only bookkeeping was left");
+        std::fs::create_dir_all(hub.join("models--gradium--phonon-voices")).unwrap();
+        std::fs::create_dir_all(hub.join("models--other--thing")).unwrap();
+        super::remove_in("phonon", &d, super::REMOVE_WAIT);
+        assert!(hub.join("models--other--thing").is_dir(), "a foreign folder keeps the cache");
+        assert!(d.join("hf").is_dir());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn qwen3_removal_removes_its_models_and_python() {
+        let d = std::env::temp_dir().join(format!("inkvoice-remove-qwen3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let hub = d.join("hf").join("hub");
+        std::fs::create_dir_all(hub.join("models--Qwen--Qwen3-TTS-12Hz-0.6B-Base")).unwrap();
+        std::fs::create_dir_all(hub.join(super::WORD_TIMING_MODEL)).unwrap();
+        std::fs::create_dir_all(hub.join("models--gradium--phonon-31m-en")).unwrap();
+        fake_install(&d, "qwen3");
+        fake_install(&d, "phonon");
+        assert!(super::remove_in("qwen3", &d, super::REMOVE_WAIT));
+        assert!(!d.join("venv-qwen3").exists());
+        assert!(!hub.join("models--Qwen--Qwen3-TTS-12Hz-0.6B-Base").exists());
+        assert!(!hub.join(super::WORD_TIMING_MODEL).exists());
+        assert!(hub.join("models--gradium--phonon-31m-en").is_dir());
+        assert!(super::installed_in("phonon", &d), "Phonon keeps working");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn qwen3_removal_alone_removes_the_shared_cache() {
+        let d = std::env::temp_dir().join(format!("inkvoice-remove-qwen3-alone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let hub = d.join("hf").join("hub");
+        // the layout Qwen3's huggingface_hub writes: file contents in a hub-wide blobs folder
+        for f in ["models--Qwen--Qwen3-TTS-12Hz-0.6B-Base", super::WORD_TIMING_MODEL, "blobs", ".locks"] {
+            std::fs::create_dir_all(hub.join(f)).unwrap();
+        }
+        std::fs::write(hub.join("blobs").join("weights"), b"x").unwrap();
+        std::fs::write(hub.join("CACHEDIR.TAG"), b"").unwrap();
+        fake_install(&d, "qwen3");
+        fake_install(&d, "kokoro");
+        super::remove_in("qwen3", &d, super::REMOVE_WAIT);
+        assert!(!d.join("hf").exists(), "no installed engine uses the cache");
+        assert!(super::installed_in("kokoro", &d), "Kokoro keeps working");
+
+        for f in ["models--Qwen--Qwen3-TTS-12Hz-0.6B-Base", "models--other--thing", "blobs"] {
+            std::fs::create_dir_all(hub.join(f)).unwrap();
+        }
+        super::remove_in("qwen3", &d, super::REMOVE_WAIT);
+        assert!(hub.join("models--other--thing").is_dir(), "a foreign folder keeps the cache");
+        assert!(hub.join("blobs").is_dir());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Open a file the way a running worker holds its libraries: nobody else may delete it.
+    #[cfg(windows)]
+    fn hold(p: &std::path::Path) -> std::fs::File {
+        use std::os::windows::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new().read(true).share_mode(0).open(p).unwrap()
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn removal_waits_for_a_file_that_is_let_go() {
+        let d = std::env::temp_dir().join(format!("inkvoice-remove-retry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        fake_install(&d, "qwen3");
+        let lib = d.join("venv-qwen3").join("Lib").join("site-packages").join("faster_qwen3_tts").join("core.pyd");
+        std::fs::write(&lib, b"x").unwrap();
+        let held = hold(&lib);
+        let worker = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            drop(held);
+        });
+        let clean = super::remove_in("qwen3", &d, std::time::Duration::from_secs(10));
+        worker.join().unwrap();
+        assert!(clean, "the removal went through once the file was free");
+        assert!(!d.join("venv-qwen3").exists());
+        let r = super::Removal { clean, installed: super::installed_in("qwen3", &d) };
+        assert_eq!(r.notice("Qwen3"), Ok("Removed Qwen3".to_string()));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn removal_that_leaves_files_is_not_reported_as_removed() {
+        let d = std::env::temp_dir().join(format!("inkvoice-remove-held-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        fake_install(&d, "kokoro");
+        let model = d.join("models").join("kokoro").join("voices-v1.0.bin");
+        let held = hold(&model);
+        let t0 = std::time::Instant::now();
+        let clean = super::remove_in("kokoro", &d, std::time::Duration::from_millis(300));
+        assert!(!clean && model.exists(), "the held file is still there");
+        assert!(t0.elapsed() >= std::time::Duration::from_millis(300), "it kept trying for the whole wait");
+        assert!(t0.elapsed() < std::time::Duration::from_secs(5), "and then gave up");
+        let r = super::Removal { clean, installed: super::installed_in("kokoro", &d) };
+        assert!(r.notice("Kokoro").is_err_and(|t| t.contains("could not be removed")));
+        // an engine that still passes the installed check is not reported as removed either
+        assert!(super::Removal { clean: true, installed: true }.notice("Kokoro").is_err());
+        assert!(!r.installed && super::leftovers_in("kokoro", &d), "not installed, but still removable");
+        drop(held);
+        assert!(super::remove_in("kokoro", &d, super::REMOVE_WAIT));
+        assert!(!super::installed_in("kokoro", &d));
+        assert!(!super::leftovers_in("kokoro", &d), "nothing is left to remove");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// What a removal that stopped part way leaves: the engine no longer passes the installed
+    /// check, but folders of its own are still on disk and a second removal clears them.
+    #[test]
+    fn a_half_removed_engine_has_leftovers_until_it_is_removed_again() {
+        let d = std::env::temp_dir().join(format!("inkvoice-leftovers-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let names = || super::SPECS.iter().map(|s| s.name);
+        assert!(names().all(|n| !super::leftovers_in(n, &d)), "an empty data folder has none");
+
+        for n in names() {
+            fake_install(&d, n);
+        }
+        std::fs::create_dir_all(d.join("hf").join("hub").join("models--gradium--phonon-31m-en")).unwrap();
+        assert!(names().all(|n| !super::leftovers_in(n, &d)), "an installed engine is not a leftover");
+
+        // Qwen3 lost its Python and one Kokoro model file went, the rest stayed behind
+        std::fs::remove_file(super::python_in_venv(&d.join("venv-qwen3"))).unwrap();
+        std::fs::remove_file(d.join("models").join("kokoro").join("voices-v1.0.bin")).unwrap();
+        assert!(!super::installed_in("qwen3", &d) && super::leftovers_in("qwen3", &d));
+        assert!(!super::installed_in("kokoro", &d) && super::leftovers_in("kokoro", &d));
+        assert!(!super::leftovers_in("woof", &d) && !super::leftovers_in("phonon", &d), "the others are untouched");
+
+        assert!(super::remove_in("qwen3", &d, super::REMOVE_WAIT));
+        assert!(super::remove_in("kokoro", &d, super::REMOVE_WAIT));
+        assert!(!super::leftovers_in("qwen3", &d) && !super::leftovers_in("kokoro", &d));
+        assert!(super::installed_in("woof", &d) && super::installed_in("phonon", &d));
+
+        // Phonon's package went but its model folder stayed
+        std::fs::remove_dir_all(d.join("venv").join("Lib").join("site-packages").join("ptts")).unwrap();
+        assert!(super::leftovers_in("phonon", &d));
+        assert!(super::remove_in("phonon", &d, super::REMOVE_WAIT));
+        assert!(!super::leftovers_in("phonon", &d));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn clearing_the_download_cache_leaves_engines_installed() {
+        let d = std::env::temp_dir().join(format!("inkvoice-clear-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        fake_install(&d, "kokoro");
+        fake_install(&d, "qwen3");
+        let wheel = d.join("cache").join("uv").join("wheels").join("torch.whl");
+        std::fs::create_dir_all(wheel.parent().unwrap()).unwrap();
+        std::fs::write(&wheel, b"x").unwrap();
+        std::fs::create_dir_all(d.join("tools")).unwrap();
+        std::fs::create_dir_all(d.join("python")).unwrap();
+        super::clear_download_cache(&d);
+        assert!(!d.join("cache").join("uv").exists());
+        assert!(super::installed_in("kokoro", &d) && super::installed_in("qwen3", &d));
+        assert!(d.join("tools").is_dir() && d.join("python").is_dir(), "the installer's own tools stay");
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// Full install into an empty data folder, printing the progress the UI would show. Run with:

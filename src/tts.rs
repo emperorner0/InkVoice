@@ -3,7 +3,7 @@
 use crate::player::Word;
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex};
 
@@ -46,7 +46,7 @@ pub struct Tts {
 }
 
 impl Tts {
-    pub fn start(cmd: Vec<String>, ctx: eframe::egui::Context) -> Self {
+    pub fn start(cmd: Vec<String>, key: Option<String>, ctx: eframe::egui::Context) -> Self {
         let queue: Arc<(Mutex<Queue>, Condvar)> = Arc::default();
         let (ev_tx, rx) = std::sync::mpsc::channel::<Event>();
         let child: Arc<Mutex<Option<Child>>> = Arc::default();
@@ -76,7 +76,7 @@ impl Tts {
                 };
                 let Some(job) = job else { break };
                 send(Event::Started(job.out.clone()));
-                let result = run_job(&cmd, &child_t, &mut io, &mut id, &job, &send);
+                let result = run_job(&cmd, &key, &child_t, &mut io, &mut id, &job, &send);
                 let preempted = {
                     let mut q = queue_t.0.lock().unwrap();
                     q.running = None;
@@ -131,11 +131,35 @@ impl Tts {
         cv.notify_one();
     }
 
+    /// Drop one job: taken off the queue while it still waits; when it is the job running,
+    pub fn cancel_one(&self, out: &Path) {
+        let (lock, cv) = &*self.queue;
+        let mut q = lock.lock().unwrap();
+        q.jobs.retain(|j| j.out != out);
+        if q.running.as_ref().is_some_and(|r| r.out == out) {
+            q.preempted = true;
+            if let Some(c) = self.child.lock().unwrap().as_mut() {
+                let _ = c.kill();
+            }
+        }
+        cv.notify_one();
+    }
+
     /// Drop every queued job and stop the one in progress.
     pub fn cancel(&self) {
         self.queue.0.lock().unwrap().jobs.clear();
         if let Some(c) = self.child.lock().unwrap().as_mut() {
             let _ = c.kill();
+        }
+    }
+
+    /// Like `cancel`, but also wait until the worker process is gone, so that its files can
+    /// be deleted.
+    pub fn stop(&self) {
+        self.queue.0.lock().unwrap().jobs.clear();
+        if let Some(c) = self.child.lock().unwrap().as_mut() {
+            let _ = c.kill();
+            let _ = c.wait();
         }
     }
 }
@@ -151,6 +175,7 @@ impl Drop for Tts {
 
 fn run_job(
     cmd: &[String],
+    key: &Option<String>,
     child: &Mutex<Option<Child>>,
     io: &mut Option<(ChildStdin, BufReader<ChildStdout>)>,
     id: &mut u64,
@@ -166,6 +191,9 @@ fn run_job(
             .env("INKVOICE_DATA", &data)
             .env("HF_HOME", data.join("hf"))
             .env("PYTHONIOENCODING", "utf-8");
+        if let Some(k) = key {
+            command.env("INKVOICE_NORMALIZE_KEY", k);
+        }
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -242,7 +270,7 @@ for line in sys.stdin:
 
     #[test]
     fn play_now_interrupts_background_work_and_resumes_it() {
-        let tts = Tts::start(vec!["python3".into(), "-c".into(), FAKE.into()], eframe::egui::Context::default());
+        let tts = Tts::start(vec!["python3".into(), "-c".into(), FAKE.into()], None, eframe::egui::Context::default());
         let next = |timeout: f32| tts.rx.recv_timeout(Duration::from_secs_f32(timeout)).ok();
 
         tts.submit(job("background", None), false);
@@ -283,5 +311,56 @@ for line in sys.stdin:
         let bg_restart = log.iter().rposition(|l| l == "started background").unwrap();
         assert!(listen_done < bg_restart, "background job resumes after the requested one");
         assert!(background_done, "background job was finished after all");
+    }
+
+    /// Cancelling one job takes only that job: a queued one vanishes without an event, the
+    /// running one stops (reported as Interrupted) and the next job starts right after.
+    #[test]
+    fn cancel_one_skips_only_that_job() {
+        let tts = Tts::start(vec!["python3".into(), "-c".into(), FAKE.into()], None, eframe::egui::Context::default());
+        let next = |timeout: f32| tts.rx.recv_timeout(Duration::from_secs_f32(timeout)).ok();
+
+        tts.submit(job("one", None), false);
+        tts.submit(job("two", None), false);
+        tts.submit(job("three", None), false);
+        assert!(matches!(next(5.0), Some(Event::Started(p)) if p == PathBuf::from("one")));
+        std::thread::sleep(Duration::from_millis(300)); // "two" and "three" wait, "one" runs
+        tts.cancel_one(&PathBuf::from("two")); // still queued: dropped, no event
+        tts.cancel_one(&PathBuf::from("one")); // running: stopped, reported as interrupted
+        let mut log = Vec::new();
+        while let Some(ev) = next(15.0) {
+            let tag = match &ev {
+                Event::Started(p) => format!("started {}", p.display()),
+                Event::Done { out, .. } => format!("done {}", out.display()),
+                Event::Interrupted(p) => format!("interrupted {}", p.display()),
+                Event::Failed(p, e) => panic!("{} failed: {e}", p.display()),
+                _ => continue,
+            };
+            log.push(tag.clone());
+            if tag == "done three" {
+                break;
+            }
+        }
+        assert_eq!(log, vec!["interrupted one", "started three", "done three"]);
+    }
+
+    /// Stopping returns only once the worker process has exited, and nothing queued starts
+    /// it again.
+    #[test]
+    fn stop_waits_for_the_worker_process() {
+        let tts = Tts::start(vec!["python3".into(), "-c".into(), FAKE.into()], None, eframe::egui::Context::default());
+        let next = |timeout: f32| tts.rx.recv_timeout(Duration::from_secs_f32(timeout)).ok();
+
+        tts.submit(job("one", None), false);
+        tts.submit(job("two", None), false);
+        assert!(matches!(next(5.0), Some(Event::Started(p)) if p == PathBuf::from("one")));
+        std::thread::sleep(Duration::from_millis(500)); // the process is up and busy with "one"
+        assert!(matches!(tts.child.lock().unwrap().as_mut().map(|c| c.try_wait()), Some(Ok(None))), "worker runs");
+
+        tts.stop();
+        let exited = tts.child.lock().unwrap().as_mut().is_none_or(|c| matches!(c.try_wait(), Ok(Some(_))));
+        assert!(exited, "the worker process is gone when stop returns");
+        assert!(matches!(next(5.0), Some(Event::Failed(p, _)) if p == PathBuf::from("one")));
+        assert!(next(1.0).is_none(), "the queued job was dropped, not started");
     }
 }

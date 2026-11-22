@@ -2,7 +2,7 @@
 use crate::config::{self, Config, Kind};
 use crate::player::Unit;
 use crate::theme::*;
-use crate::{App, View};
+use crate::{export, App, View};
 use eframe::egui::{
     self, text::CCursor, text::LayoutJob, Align, Align2, Button, FontFamily, FontId, Frame, Key, Layout, Margin,
     Modifiers, ProgressBar, Rect, RichText, Sense, Slider, Stroke, StrokeKind, TextFormat, TextWrapMode, Vec2,
@@ -105,6 +105,44 @@ fn ago(secs: u64) -> String {
     }
 }
 
+/// "1.4 MB", and GB above 1024 MB.
+fn fmt_size(bytes: u64) -> String {
+    let mb = bytes as f64 / (1024.0 * 1024.0);
+    if mb >= 1024.0 { format!("{:.1} GB", mb / 1024.0) } else { format!("{mb:.1} MB") }
+}
+
+/// When an audio file was made: "made today", "made 3 days ago".
+fn made(when: u64) -> String {
+    if when == 0 {
+        return String::new();
+    }
+    let d = crate::book::now_secs().saturating_sub(when) / 86400;
+    match d {
+        0 => "made today".into(),
+        1 => "made yesterday".into(),
+        2..=30 => format!("made {d} days ago"),
+        _ if d / 30 == 1 => "made 1 month ago".into(),
+        _ => format!("made {} months ago", d / 30),
+    }
+}
+
+/// The inline "delete all audio?" confirmation, in the style of the remove-book one: what
+/// would go, how much it is, then Delete or Cancel. The counts were gathered when the
+/// confirmation was opened, so this draws without touching the disk.
+fn confirm_box(ui: &mut egui::Ui, act: &mut Option<Act>, c: &crate::ConfirmDel, question: &str) {
+    ui.label(RichText::new(question).color(DANGER));
+    let plural = if c.files == 1 { "" } else { "s" };
+    ui.label(RichText::new(format!("{} file{plural} · {}. They go to the Recycle Bin.", c.files, fmt_size(c.bytes))).small().color(DIM));
+    ui.horizontal(|ui| {
+        if ui.add(Button::new(RichText::new("Delete").color(ON_ACCENT)).fill(DANGER)).clicked() {
+            *act = Some(Act::DelAll(c.id.clone(), c.scope.clone()));
+        }
+        if ui.button("Cancel").clicked() {
+            *act = Some(Act::CancelDelAll);
+        }
+    });
+}
+
 /// Things clicked inside a panel, applied after drawing (keeps borrows simple).
 enum Act {
     Open(String),
@@ -117,8 +155,33 @@ enum Act {
     CancelRemove,
     Remove(String),
     GoChapter(usize),
+    /// set this section's own skip-when-listening choice
+    SetSkip(usize, bool),
     GenerateAll,
-    Regenerate(usize),
+    /// regenerate a chapter of a book with the current voice settings
+    Regenerate(String, usize),
+    /// delete one audio file (with its timing file)
+    DelAudioFile(std::path::PathBuf),
+    /// delete a section's audio for the current voice
+    DelSectionAudio(String, usize),
+    /// ask / confirm / do a bulk audio deletion: one voice, or the whole book
+    AskDelAll(String, crate::DelAll),
+    CancelDelAll,
+    DelAll(String, crate::DelAll),
+    /// remove a book's leftover files
+    CleanJunk(String),
+    /// show one audio folder in the system file manager
+    OpenAudioFolder(std::path::PathBuf),
+    /// open the Export window for one book and voice
+    ExportVoice(String, String),
+    /// play a short preview of a spoken form
+    HearForm(String),
+    /// commit a new spoken form for table row `row`
+    PronSet(usize, String),
+    PronRemove(usize),
+    PronAdd(String, String),
+    /// regenerate the chapters offered after a pronunciation change
+    PronRegen,
 }
 
 impl App {
@@ -127,7 +190,7 @@ impl App {
             Some(Act::Open(id)) => self.open_reader(&id),
             Some(Act::Select(id)) => self.sel = Some(id),
             Some(Act::PlayPath(p, u)) => self.play_path(&p, u, None),
-            Some(Act::PlayUnit(u)) => self.play_unit(u, None),
+            Some(Act::PlayUnit(u)) => self.play_unit_resuming(u),
             Some(Act::Toggle) => self.toggle_play(),
             Some(Act::Enqueue(u)) => {
                 if self.engine_ready() {
@@ -139,7 +202,50 @@ impl App {
             Some(Act::Remove(id)) => self.remove_book(&id),
             Some(Act::GoChapter(i)) => self.go(i, 0),
             Some(Act::GenerateAll) => self.generate_all(),
-            Some(Act::Regenerate(ch)) => self.regenerate_chapter(ch),
+            Some(Act::SetSkip(i, skip)) => {
+                if let Some(b) = self.open_book_mut() {
+                    if let Some(c) = b.chapters.get_mut(i) {
+                        c.skip = Some(skip);
+                        let _ = b.save();
+                    }
+                }
+            }
+            Some(Act::Regenerate(id, ch)) => self.regenerate_chapter(&id, ch),
+            Some(Act::DelAudioFile(p)) => self.delete_audio_file(&p),
+            Some(Act::DelSectionAudio(id, ch)) => self.delete_section_audio(&id, ch),
+            Some(Act::AskDelAll(id, scope)) => self.ask_del_all(&id, scope),
+            Some(Act::CancelDelAll) => self.confirm_del_audio = None,
+            Some(Act::DelAll(id, scope)) => match scope {
+                crate::DelAll::Voice(profile) => self.delete_voice_audio(&id, &profile),
+                crate::DelAll::Book => self.delete_book_audio(&id),
+            },
+            Some(Act::CleanJunk(id)) => self.clean_leftovers(&id),
+            Some(Act::OpenAudioFolder(p)) => crate::open_folder(&p),
+            Some(Act::ExportVoice(id, profile)) => self.open_export(&id, &profile),
+            Some(Act::PronSet(row, say)) => {
+                // the word comes from the saved row, so a hand edit between frames cannot
+                // redirect the change onto another entry
+                let word = self.pron.entries.get(row).map(|(w, _)| w.clone());
+                match word.map(|w| self.pron_set(&w, &say, false)) {
+                    Some(Ok(_)) => {}
+                    Some(Err(e)) => self.pron_err = Some((Some(row), e)),
+                    None => {}
+                }
+            }
+            Some(Act::HearForm(say)) => self.hear_form(&say),
+            Some(Act::PronRemove(row)) => self.pron_remove(row),
+            Some(Act::PronAdd(word, say)) => {
+                self.pron_err = None;
+                if let Err(e) = self.pron_set(&word, &say, false) {
+                    self.pron_err = Some((None, e));
+                } else {
+                    self.ctx.data_mut(|d| {
+                        d.remove_temp::<String>(egui::Id::new("pron-add-word"));
+                        d.remove_temp::<String>(egui::Id::new("pron-add-say"));
+                    });
+                }
+            }
+            Some(Act::PronRegen) => self.accept_regen_offer(),
             None => {}
         }
     }
@@ -186,7 +292,9 @@ impl App {
             if k[8] { self.next_page(); }
         }
         if k[9] {
-            if self.show_settings {
+            if self.pron_win.is_some() {
+                self.close_pron_win();
+            } else if self.show_settings {
                 self.show_settings = false;
                 self.apply_worker_settings();
                 self.cfg.save();
@@ -224,7 +332,9 @@ impl App {
             }
         }
         self.settings_window(ctx);
+        self.pron_window(ctx);
         self.install_window(ctx);
+        self.export_window(ctx);
         self.toast(ctx);
     }
 
@@ -468,8 +578,9 @@ impl App {
     fn details_panel(&mut self, ctx: &egui::Context) {
         let Some(id) = self.sel.clone() else { return };
         let Some(b) = self.book(&id) else { return };
-        let (title, author, chapters, pages, frac, opened) =
-            (b.title.clone(), b.author.clone(), b.chapters.len(), b.page_count(), b.read_fraction(), b.opened);
+        // counts leave out sections that are skipped when listening
+        let (chapters, pages) = b.chapters.iter().filter(|c| !c.skipped()).fold((0, 0), |(n, p), c| (n + 1, p + c.pages.len()));
+        let (title, author, frac, opened) = (b.title.clone(), b.author.clone(), b.read_fraction(), b.opened);
         let at = b.chapters.get(b.pos.0).map(|c| format!("{} · page {}", c.title, b.pos.1 + 1)).unwrap_or_default();
         let started = b.pos != (0, 0);
         let mut act = None;
@@ -500,15 +611,16 @@ impl App {
                         act = Some(Act::Open(id.clone()));
                     }
 
-                    // ---- audio ----
-                    let items: Vec<(String, std::path::PathBuf, Unit, String, f32)> = self
-                        .lib_audio
-                        .get(&id)
-                        .map(|v| v.iter().map(|a| (a.profile.clone(), a.path.clone(), a.unit.clone(), a.label.clone(), a.duration)).collect())
-                        .unwrap_or_default();
-                    let total: f32 = items.iter().map(|i| i.4).sum();
-                    section(ui, &format!("AUDIO  ·  {} files · {}", items.len(), fmt_time(total)));
-                    if items.is_empty() {
+                    // ---- audio manager ----
+                    let items = self.lib_audio.get(&id).cloned().unwrap_or_default();
+                    let junk = self.lib_junk.get(&id).cloned().unwrap_or_default();
+                    let skipped: Vec<bool> =
+                        self.book(&id).map(|b| b.chapters.iter().map(|c| c.skipped()).collect()).unwrap_or_default();
+                    let audio_root = self.book(&id).map(|b| b.dir().join("audio"));
+                    let (total, bytes): (f32, u64) = items.iter().fold((0.0, 0), |(t, s), i| (t + i.duration, s + i.size));
+                    let junk_bytes: u64 = junk.iter().map(|j| j.size).sum();
+                    section(ui, &format!("AUDIO  ·  {} files · {} · {}", items.len(), fmt_time(total), fmt_size(bytes)));
+                    if items.is_empty() && junk.is_empty() {
                         ui.label(RichText::new("No audio yet. Open the book and press ⏵ to listen.").color(DIM));
                     }
                     let (now_path, playing) = self
@@ -516,30 +628,105 @@ impl App {
                         .as_ref()
                         .map(|p| (p.now.as_ref().map(|n| n.path.clone()), p.is_playing()))
                         .unwrap_or((None, false));
+                    let voice = self.cfg.profile();
+                    let confirming = self.confirm_del_audio.clone();
                     let mut last_profile = String::new();
-                    for (profile, path, unit, label, dur) in items {
-                        if profile != last_profile {
-                            ui.add_space(4.0);
-                            ui.label(RichText::new(config::profile_label(&profile)).small().color(ACCENT));
-                            last_profile = profile;
-                        }
-                        ui.horizontal(|ui| {
-                            let is_now = now_path.as_ref() == Some(&path);
-                            let glyph = if is_now && playing { "⏸" } else { "⏵" };
-                            let color = if is_now { ACCENT } else { TEXT };
-                            if ui.add(Button::new(RichText::new(glyph).color(color)).min_size(Vec2::new(28.0, 24.0))).clicked() {
-                                act = Some(if is_now { Act::Toggle } else { Act::PlayPath(path.clone(), unit.clone()) });
-                            }
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                ui.label(RichText::new(fmt_time(dur)).small().color(DIM));
-                                ui.style_mut().wrap_mode = Some(TextWrapMode::Truncate);
-                                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                                    ui.label(RichText::new(&label).color(color));
+                    for it in &items {
+                        if it.profile != last_profile {
+                            last_profile = it.profile.clone();
+                            ui.add_space(6.0);
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(config::profile_label(&it.profile)).small().color(ACCENT));
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if icon(ui, "🗑", "Delete all audio of this voice…").clicked() {
+                                        act = Some(Act::AskDelAll(id.clone(), crate::DelAll::Voice(it.profile.clone())));
+                                    }
+                                    if icon(ui, "📂", "Open this voice's folder in the file manager").clicked() {
+                                        let dir = audio_root.as_ref().map(|r| r.join(&it.profile)).unwrap_or_default();
+                                        act = Some(Act::OpenAudioFolder(dir));
+                                    }
+                                    if icon(ui, "📤", "Export this voice's audio…").clicked() {
+                                        act = Some(Act::ExportVoice(id.clone(), it.profile.clone()));
+                                    }
                                 });
+                            });
+                            let g: Vec<_> = items.iter().filter(|i| i.profile == it.profile).collect();
+                            let mut secs = 0;
+                            let mut prev_ch = None;
+                            for i in &g {
+                                if Some(i.unit.ch) != prev_ch {
+                                    secs += 1;
+                                    prev_ch = Some(i.unit.ch);
+                                }
+                            }
+                            let (gdur, gbytes): (f32, u64) = g.iter().fold((0.0, 0), |(t, s), i| (t + i.duration, s + i.size));
+                            let plural = if secs == 1 { "" } else { "s" };
+                            ui.label(RichText::new(format!("{secs} section{plural} · {} · {}", fmt_time(gdur), fmt_size(gbytes))).small().color(DIM));
+                            let scope = crate::DelAll::Voice(it.profile.clone());
+                            if let Some(c) = confirming.as_ref().filter(|c| c.id == id && c.scope == scope) {
+                                let q = format!("Delete all audio of {}?", config::profile_label(&it.profile));
+                                confirm_box(ui, &mut act, c, &q);
+                            }
+                        }
+                        // one row: play, title, then regenerate and delete for this file
+                        ui.horizontal(|ui| {
+                            let is_now = now_path.as_ref() == Some(&it.path);
+                            let glyph = if is_now && playing { "⏸" } else { "⏵" };
+                            let dim = skipped.get(it.unit.ch).copied().unwrap_or(false);
+                            let color = if is_now { ACCENT } else if dim { DIM } else { TEXT };
+                            if ui.add(Button::new(RichText::new(glyph).color(if is_now { ACCENT } else { TEXT })).min_size(Vec2::new(28.0, 24.0))).clicked() {
+                                act = Some(if is_now { Act::Toggle } else { Act::PlayPath(it.path.clone(), it.unit.clone()) });
+                            }
+                            ui.vertical(|ui| {
+                                ui.horizontal(|ui| {
+                                    ui.style_mut().wrap_mode = Some(TextWrapMode::Truncate);
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        if icon(ui, "🗑", "Delete this file (to the Recycle Bin)").clicked() {
+                                            act = Some(Act::DelAudioFile(it.path.clone()));
+                                        }
+                                        if it.profile == voice && icon(ui, "⟳", "Make this section's audio again with the current settings").clicked() {
+                                            act = Some(Act::Regenerate(id.clone(), it.unit.ch));
+                                        }
+                                        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                                            ui.label(RichText::new(&it.label).color(color));
+                                        });
+                                    });
+                                });
+                                let when = made(it.modified);
+                                let meta = if when.is_empty() {
+                                    format!("{} · {}", fmt_time(it.duration), fmt_size(it.size))
+                                } else {
+                                    format!("{} · {} · {}", fmt_time(it.duration), fmt_size(it.size), when)
+                                };
+                                ui.label(RichText::new(meta).small().color(DIM));
                             });
                         });
                     }
 
+                    // leftovers and the book-wide deletion
+                    if !junk.is_empty() {
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(format!("Leftovers: {} files · {}", junk.len(), fmt_size(junk_bytes))).small().color(DIM))
+                                .on_hover_text("Files no generation needs any more: interrupted streams, part-written files, estimated timings, timing files without their audio, and audio of sections the book no longer has");
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui.button("Clean up").on_hover_text("Move the leftover files to the Recycle Bin").clicked() {
+                                    act = Some(Act::CleanJunk(id.clone()));
+                                }
+                            });
+                        });
+                    }
+                    if !items.is_empty() {
+                        ui.add_space(4.0);
+                        if let Some(c) = confirming.as_ref().filter(|c| c.id == id && c.scope == crate::DelAll::Book) {
+                            confirm_box(ui, &mut act, c, "Delete all audio of this book?");
+                        } else if ui.add(Button::new(RichText::new("🗑  Delete all audio").color(DIM)).frame(false))
+                            .on_hover_text("Every voice's audio and timing files; the book itself stays")
+                            .clicked()
+                        {
+                            act = Some(Act::AskDelAll(id.clone(), crate::DelAll::Book));
+                        }
+                    }
                     ui.add_space(24.0);
                     ui.separator();
                     if self.confirm_remove.as_deref() == Some(id.as_str()) {
@@ -564,7 +751,12 @@ impl App {
 
     fn contents_panel(&mut self, ctx: &egui::Context) {
         let Some(b) = self.open_book() else { return };
-        let chapters: Vec<(String, usize)> = b.chapters.iter().map(|c| (c.title.clone(), c.pages.len())).collect();
+        let chapters: Vec<(String, usize, bool, &'static str)> = b
+            .chapters
+            .iter()
+            .map(|c| (c.title.clone(), c.pages.len(), c.skipped(), c.kind.map(|k| k.label()).unwrap_or("Section")))
+            .collect();
+        let kept = chapters.iter().filter(|c| !c.2).count();
         let book_id = b.id.clone();
         let page_mode = self.cfg.page_mode;
         let (now_unit, playing) = self
@@ -581,14 +773,14 @@ impl App {
             .width_range(220.0..=440.0)
             .frame(Frame::side_top_panel(&ctx.style()).inner_margin(Margin::symmetric(12, 14)))
             .show(ctx, |ui| {
-                ui.label(RichText::new(format!("CONTENTS  ·  {} chapters", chapters.len())).small().strong().color(DIM));
+                ui.label(RichText::new(format!("CONTENTS  ·  {kept} chapters")).small().strong().color(DIM));
                 ui.add_space(6.0);
                 let footer_h = 70.0;
                 egui::ScrollArea::vertical()
                     .max_height(ui.available_height() - footer_h)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        for (i, (title, pages)) in chapters.iter().enumerate() {
+                        for (i, (title, pages, skipped, kind)) in chapters.iter().enumerate() {
                             let current = self.ch == i;
                             ui.horizontal(|ui| {
                                 ui.allocate_ui_with_layout(Vec2::new(40.0, 24.0), Layout::centered_and_justified(egui::Direction::LeftToRight), |ui| {
@@ -596,10 +788,10 @@ impl App {
                                         let n = (0..*pages)
                                             .filter(|&p| {
                                                 let path = self.book(&book_id).map(|b| self.audio_path(b, i, Some(p)));
-                                                path.is_some_and(|p| self.have.contains(&p))
+                                                path.is_some_and(|p| self.is_ready(&p))
                                             })
                                             .count();
-                                        if n == *pages {
+                                        if n == *pages && !skipped {
                                             ready_total += 1;
                                         }
                                         let (t, c) = if n == *pages { ("✔".to_string(), ACCENT) } else if n > 0 { (format!("{n}/{pages}"), DIM) } else { (String::new(), FAINT) };
@@ -613,8 +805,10 @@ impl App {
                                         ui.label(RichText::new(format!("{:.0}%", prog * 100.0)).small().color(ACCENT)).on_hover_text("Generating…");
                                     } else if self.pending.contains_key(&path) {
                                         ui.label(RichText::new("⏳").color(FAINT)).on_hover_text("Queued");
-                                    } else if self.have.contains(&path) {
-                                        ready_total += 1;
+                                    } else if self.is_ready(&path) {
+                                        if !skipped {
+                                            ready_total += 1;
+                                        }
                                         let is_now = now_unit.as_ref() == Some(&unit);
                                         let glyph = if is_now && playing { "⏸" } else { "⏵" };
                                         let r = ui.add(Button::new(RichText::new(glyph).color(ACCENT)).frame(false));
@@ -629,14 +823,32 @@ impl App {
                                     }
                                 });
                                 ui.style_mut().wrap_mode = Some(TextWrapMode::Truncate);
-                                let text = RichText::new(title).color(if current { ACCENT } else { TEXT });
+                                let text = RichText::new(title).color(if current { ACCENT } else if *skipped { DIM } else { TEXT });
                                 let r = ui.selectable_label(current, text);
+                                if *skipped {
+                                    ui.label(RichText::new(format!("· {kind}")).small().color(FAINT));
+                                }
                                 if r.clicked() {
                                     act = Some(Act::GoChapter(i));
                                 }
+                                let has_audio = self.book(&book_id).is_some_and(|b| {
+                                    if page_mode {
+                                        (0..*pages).any(|p| self.is_ready(&self.audio_path(b, i, Some(p))))
+                                    } else {
+                                        self.is_ready(&self.audio_path(b, i, None))
+                                    }
+                                });
                                 r.context_menu(|ui| {
+                                    if ui.button(if *skipped { "Include when listening" } else { "Skip when listening" }).clicked() {
+                                        act = Some(Act::SetSkip(i, !*skipped));
+                                        ui.close_menu();
+                                    }
                                     if ui.button("⟳  Regenerate audio").on_hover_text("Delete this chapter's audio for the current voice and make it again with the current settings").clicked() {
-                                        act = Some(Act::Regenerate(i));
+                                        act = Some(Act::Regenerate(book_id.clone(), i));
+                                        ui.close_menu();
+                                    }
+                                    if has_audio && ui.button("🗑  Delete audio").on_hover_text("Move this section's audio files for the current voice to the Recycle Bin").clicked() {
+                                        act = Some(Act::DelSectionAudio(book_id.clone(), i));
                                         ui.close_menu();
                                     }
                                 });
@@ -645,7 +857,7 @@ impl App {
                     });
                 ui.separator();
                 let unit_word = if page_mode { "chapters complete" } else { "chapters ready" };
-                ui.label(RichText::new(format!("{ready_total} / {} {unit_word} · {}", chapters.len(), config::profile_label(&self.cfg.profile()))).small().color(DIM));
+                ui.label(RichText::new(format!("{ready_total} / {kept} {unit_word} · {}", config::profile_label(&self.cfg.profile()))).small().color(DIM));
                 let w = ui.available_width();
                 if ui.add_sized([w, 30.0], Button::new("🎧  Generate whole book")).on_hover_text("Queue audio for every chapter (or page, in page mode)").clicked() {
                     act = Some(Act::GenerateAll);
@@ -662,6 +874,13 @@ impl App {
         let page = chapter.pages[pg].clone();
         let ch_title = chapter.title.clone();
         let (n_pages, n_ch) = (chapter.pages.len(), b.chapters.len());
+        // listening counts and numbers leave out skipped sections; a skipped section shows
+        // its kind where the chapter number would be
+        let kept: Vec<usize> = b.chapters.iter().enumerate().filter(|(_, c)| !c.skipped()).map(|(i, _)| i).collect();
+        let place = kept.iter().position(|&i| i == ch).map_or_else(
+            || chapter.kind.map(|k| k.label()).unwrap_or("Section").to_string(),
+            |p| format!("Chapter {} of {}", p + 1, kept.len()),
+        );
         let page_start = b.page_char_starts(ch)[pg];
         let book_id = b.id.clone();
 
@@ -711,6 +930,8 @@ impl App {
 
         let mut nav = 0i32;
         let mut click_char = None;
+        let mut set_pron = None;
+        let helper_on = self.cfg.normalize.enabled;
         let mut scroll = egui::ScrollArea::vertical().auto_shrink([false, false]).id_salt(("page", ch, pg));
         if self.scroll_top {
             scroll = scroll.vertical_scroll_offset(0.0);
@@ -731,14 +952,34 @@ impl App {
                         ui.add_space(14.0);
                     }
                     let resp = ui.add(egui::Label::new(galley.clone()).selectable(false).sense(Sense::click()));
+                    let can_click = audio_here || loaded_here || self.installed.contains(&self.cfg.engine);
                     // click a word to listen from there — also in chapters without audio yet
-                    if audio_here || loaded_here || self.installed.contains(&self.cfg.engine) {
+                    if can_click {
                         let resp = resp.clone().on_hover_cursor(egui::CursorIcon::PointingHand);
                         if resp.clicked() {
                             if let Some(pos) = resp.interact_pointer_pos() {
                                 let c = galley.cursor_from_pos(pos - resp.rect.min);
                                 click_char = Some(c.ccursor.index);
                             }
+                        }
+                    }
+                    // right-click a word to pin how it is spoken (pronunciation helper only);
+                    // the same char lookup the click uses finds the word under the pointer
+                    if helper_on {
+                        if resp.secondary_clicked() {
+                            if let Some(pos) = resp.interact_pointer_pos() {
+                                let c = galley.cursor_from_pos(pos - resp.rect.min).ccursor.index;
+                                self.pron_ask = word_at(&page, c).map(|w| config::peel_word(&w));
+                            }
+                        }
+                        if self.pron_ask.is_some() {
+                            let asked = self.pron_ask.clone();
+                            resp.context_menu(|ui| {
+                                if ui.button("Set pronunciation…").clicked() {
+                                    set_pron = Some(asked.unwrap());
+                                    ui.close_menu();
+                                }
+                            });
                         }
                     }
                     // keep the spoken word in view
@@ -762,7 +1003,7 @@ impl App {
                                 nav = 1;
                             }
                             ui.with_layout(Layout::centered_and_justified(egui::Direction::LeftToRight), |ui| {
-                                ui.label(RichText::new(format!("Page {} of {}  ·  Chapter {} of {}", pg + 1, n_pages, ch + 1, n_ch)).small().color(DIM));
+                                ui.label(RichText::new(format!("Page {} of {}  ·  {place}", pg + 1, n_pages)).small().color(DIM));
                             });
                         });
                     });
@@ -796,6 +1037,11 @@ impl App {
             1 => self.next_page(),
             -1 => self.prev_page(),
             _ => {}
+        }
+
+        if let Some(w) = set_pron {
+            self.pron_ask = None;
+            self.open_pron_win(&w);
         }
     }
 
@@ -1028,6 +1274,13 @@ impl App {
         }
         let mut open = true;
         let mut preview = false;
+        // picked up before the window body borrows cfg; a hand edit while Settings is open
+        // shows up through pron_sync's metadata check
+        self.pron_sync();
+        let pron_err = self.pron_err.clone();
+        let regen_offer = self.regen_offer.clone().filter(|o| !o.reader);
+        let pron_rows = self.pron.entries.clone();
+        let mut pron_acts: Vec<Act> = Vec::new();
         egui::Window::new(RichText::new("Settings").strong())
             .open(&mut open)
             .collapsible(false)
@@ -1152,6 +1405,131 @@ impl App {
                         );
                     });
 
+                ui.add_space(8.0);
+                egui::CollapsingHeader::new(RichText::new("PRONUNCIATION HELPER  ·  EXPERIMENTAL").small().strong().color(DIM))
+                    .id_salt("normalize")
+                    .default_open(std::env::var_os("SHOTS").is_some()) // screenshots only
+                    .show(ui, |ui| {
+                        dirty |= ui.checkbox(&mut cfg.normalize.enabled, "Enabled").changed();
+                        egui::Grid::new("normalize").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
+                            for (label, value, hint, secret) in [
+                                ("Server (optional)", &mut cfg.normalize.url, "http://127.0.0.1:8091/v1", false),
+                                ("Model (optional)", &mut cfg.normalize.model, "model name", false),
+                                ("Key (optional)", &mut cfg.normalize.key, "optional", true),
+                            ] {
+                                ui.label(label);
+                                let id = ui.id().with(("normalize", label));
+                                let mut s = ui.data_mut(|d| d.get_temp::<String>(id)).unwrap_or_else(|| value.clone());
+                                let r = ui.add(egui::TextEdit::singleline(&mut s).password(secret).hint_text(hint).desired_width(220.0));
+                                // keep the in-progress text across frames; commit on focus loss (Enter included), not
+                                // per keystroke, because applying restarts the voice engine
+                                if r.lost_focus() {
+                                    if s != *value {
+                                        *value = s;
+                                        dirty = true;
+                                    }
+                                    ui.data_mut(|d| d.remove_temp::<String>(id));
+                                } else if r.changed() {
+                                    ui.data_mut(|d| d.insert_temp(id, s.clone()));
+                                }
+                                ui.end_row();
+                            }
+                        });
+                        ui.label(
+                            RichText::new("Built-in rules read numbers, money, times and common abbreviations aloud correctly; no server needed.")
+                                .small()
+                                .color(DIM),
+                        );
+                        ui.label(
+                            RichText::new("With a server address filled in, a language model (any OpenAI-compatible server, local or hosted) settles ambiguous cases such as calibers and \"read\".")
+                                .small()
+                                .color(DIM),
+                        );
+                        ui.label(
+                            RichText::new("The key is only needed for hosted servers. Already generated chapters keep their audio until they are regenerated.")
+                                .small()
+                                .color(DIM),
+                        );
+                        if cfg.normalize.enabled {
+                            if std::env::var_os("SHOTS").is_some() {
+                                ui.scroll_to_cursor(Some(Align::TOP)); // screenshots only: bring the list on screen
+                            }
+                            section(ui, "PRONUNCIATIONS");
+                            egui::ScrollArea::vertical().max_height(216.0).auto_shrink([false, false]).show(ui, |ui| {
+                                if pron_rows.is_empty() {
+                                    ui.label(RichText::new("No words yet. Add one below, or right-click a word while reading.").small().color(DIM));
+                                }
+                                for (i, (w, s)) in pron_rows.iter().enumerate() {
+                                    ui.horizontal(|ui| {
+                                        ui.style_mut().wrap_mode = Some(TextWrapMode::Truncate);
+                                        ui.label(RichText::new(w).strong()).on_hover_text(format!("{w} = {s}"));
+                                        // spoken form: committed on focus loss (Enter included), then saved at once
+                                        let id = egui::Id::new("pron-say").with(config::fold_word(w));
+                                        let mut t = ui.data_mut(|d| d.get_temp::<String>(id)).unwrap_or_else(|| s.clone());
+                                        let r = ui.add(egui::TextEdit::singleline(&mut t).hint_text("spoken form").desired_width(140.0));
+                                        if r.lost_focus() {
+                                            if t.trim() != *s {
+                                                pron_acts.push(Act::PronSet(i, t.clone()));
+                                            }
+                                            ui.data_mut(|d| d.remove_temp::<String>(id));
+                                        } else if r.changed() {
+                                            ui.data_mut(|d| d.insert_temp(id, t.clone()));
+                                        }
+                                        if !t.trim().is_empty() && icon(ui, "⏵", "Hear it").clicked() {
+                                            pron_acts.push(Act::HearForm(t.trim().to_string()));
+                                        }
+                                        if icon(ui, "✖", "Remove this word").clicked() {
+                                            pron_acts.push(Act::PronRemove(i));
+                                        }
+                                    });
+                                    if let Some((row, msg)) = &pron_err {
+                                        if *row == Some(i) {
+                                            ui.label(RichText::new(msg).small().color(DANGER));
+                                        }
+                                    }
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                let (wid, sid) = (egui::Id::new("pron-add-word"), egui::Id::new("pron-add-say"));
+                                let mut w = ui.data_mut(|d| d.get_temp::<String>(wid)).unwrap_or_default();
+                                let mut s = ui.data_mut(|d| d.get_temp::<String>(sid)).unwrap_or_default();
+                                let rw = ui.add(egui::TextEdit::singleline(&mut w).hint_text("word").desired_width(110.0));
+                                let rs = ui.add(egui::TextEdit::singleline(&mut s).hint_text("spoken form").desired_width(140.0));
+                                let enter_hit = |r: &egui::Response, ui: &egui::Ui| {
+                                    r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter))
+                                };
+                                if primary(ui, "Add").clicked() || enter_hit(&rw, ui) || enter_hit(&rs, ui) {
+                                    if !w.trim().is_empty() || !s.trim().is_empty() {
+                                        pron_acts.push(Act::PronAdd(w.clone(), s.clone()));
+                                    }
+                                } else {
+                                    // the drafts live in the ui until Add commits them, not per keystroke
+                                    ui.data_mut(|d| {
+                                        d.insert_temp(wid, w.clone());
+                                        d.insert_temp(sid, s.clone());
+                                    });
+                                }
+                            });
+                            if let Some((None, msg)) = &pron_err {
+                                ui.label(RichText::new(msg).small().color(DANGER));
+                            }
+                            ui.label(
+                                RichText::new("A listed word is always spoken the given way, plural and possessive included; it applies to audio generated afterwards. The file stays hand-editable.")
+                                    .small()
+                                    .color(DIM),
+                            );
+                            if let Some(o) = regen_offer.as_ref().filter(|o| !o.chapters.is_empty()) {
+                                let n = o.chapters.len();
+                                if ui.add(Button::new(RichText::new(regen_label(&o.word, n)).color(ACCENT)).frame(false))
+                                    .on_hover_text("Existing audio keeps the old pronunciation until it is regenerated")
+                                    .clicked()
+                                {
+                                    pron_acts.push(Act::PronRegen);
+                                }
+                            }
+                        }
+                    });
+
                 section(ui, "READING");
                 egui::Grid::new("reading").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
                     ui.label("Font");
@@ -1211,6 +1589,9 @@ impl App {
                 }
               });
             });
+        for a in pron_acts {
+            self.apply(Some(a));
+        }
         if preview {
             self.preview_voice();
         }
@@ -1218,6 +1599,89 @@ impl App {
             self.show_settings = false;
             self.apply_worker_settings();
             self.cfg.save();
+            if self.regen_offer.as_ref().is_some_and(|o| !o.reader) {
+                self.regen_offer = None; // the offer lives next to where the change was made
+            }
+        }
+    }
+
+    /// The reader's "Set pronunciation" window: the clicked word, its spoken form, hear it,
+    /// Save and Cancel; after Save, chapters that already have audio can be regenerated.
+    fn pron_window(&mut self, ctx: &egui::Context) {
+        let Some(mut win) = self.pron_win.clone() else { return };
+        let id = egui::Id::new("pron-win-say");
+        let mut hear = None;
+        let mut save = false;
+        let mut regen = false;
+        let mut close = false;
+        egui::Window::new("Set pronunciation")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .default_width(360.0)
+            .show(ctx, |ui| {
+                ui.label(RichText::new("Word").small().color(DIM));
+                ui.label(RichText::new(&win.word).strong().size(17.0));
+                ui.add_space(4.0);
+                // spoken form: committed on focus loss (Enter included); the buttons read
+                // the draft either way, so a click right after typing still sees it
+                let mut s = ui.data_mut(|d| d.get_temp::<String>(id)).unwrap_or_else(|| win.say.clone());
+                let r = ui.add(egui::TextEdit::singleline(&mut s).hint_text("spoken form").desired_width(220.0));
+                if r.lost_focus() {
+                    win.say = s.trim().to_string();
+                    ui.data_mut(|d| d.remove_temp::<String>(id));
+                } else if r.changed() {
+                    ui.data_mut(|d| d.insert_temp(id, s.clone()));
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if !s.trim().is_empty() && icon(ui, "⏵", "Hear it").clicked() {
+                        hear = Some(s.trim().to_string());
+                    }
+                    if primary(ui, "Save").clicked() {
+                        win.say = s.trim().to_string();
+                        save = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        close = true;
+                    }
+                });
+                if let Some(e) = &win.err {
+                    ui.label(RichText::new(e).small().color(DANGER));
+                } else if win.saved {
+                    if let Some(o) = self.regen_offer.as_ref().filter(|o| o.reader && !o.chapters.is_empty()) {
+                        if ui.add(Button::new(RichText::new(regen_label(&o.word, o.chapters.len())).color(ACCENT)).frame(false))
+                            .on_hover_text("Existing audio keeps the old pronunciation until it is regenerated")
+                            .clicked()
+                        {
+                            regen = true;
+                        }
+                    } else {
+                        ui.label(RichText::new("Saved. It applies to audio generated from now on.").small().color(DIM));
+                    }
+                } else {
+                    ui.label(RichText::new("Always spoken this way, plural and possessive included, ignoring case.").small().color(DIM));
+                }
+            });
+        if let Some(s) = hear {
+            self.hear_form(&s);
+        }
+        if save {
+            match self.pron_set(&win.word, &win.say, true) {
+                Ok(_) => win.saved = true,
+                Err(e) => {
+                    win.err = Some(e);
+                    win.saved = false;
+                }
+            }
+        }
+        if regen {
+            self.accept_regen_offer();
+        }
+        if close || regen {
+            self.close_pron_win();
+        } else {
+            self.pron_win = Some(win);
         }
     }
 
@@ -1261,8 +1725,20 @@ impl App {
                                 }
                                 ui.label(RichText::new("✔ Installed").color(ACCENT));
                             }
-                        } else if ui.add_enabled(busy.is_none(), Button::new(RichText::new("Install").color(ON_ACCENT).strong()).fill(ACCENT)).clicked() {
-                            install = Some(s.name);
+                        } else {
+                            if ui.add_enabled(busy.is_none(), Button::new(RichText::new("Install").color(ON_ACCENT).strong()).fill(ACCENT)).clicked() {
+                                install = Some(s.name);
+                            }
+                            let confirming = self.confirm_uninstall.as_deref() == Some(s.name);
+                            if self.leftover.contains(s.name) && confirming {
+                                if ui.add(Button::new(RichText::new("Remove").color(ON_ACCENT)).fill(DANGER)).clicked() {
+                                    remove = Some(s.name);
+                                }
+                            } else if self.leftover.contains(s.name)
+                                && ui.add(Button::new(RichText::new("Remove").color(DIM)).frame(false)).on_hover_text("Delete the files this engine left behind").clicked()
+                            {
+                                self.confirm_uninstall = Some(s.name.to_string());
+                            }
                         }
                     });
                 });
@@ -1507,6 +1983,151 @@ impl App {
         }
     }
 
+    /// The Export window for one book and voice: what goes out, in which format, and
+    /// where. Its counts were gathered when it opened; drawing only reads them.
+    fn export_window(&mut self, ctx: &egui::Context) {
+        if self.export.is_none() {
+            return;
+        }
+        let busy = self.export.as_ref().is_some_and(|w| w.busy.is_some());
+        enum Ex {
+            Close,
+            Pick,
+            Start,
+            Cancel,
+            Open((std::path::PathBuf, bool)),
+        }
+        let mut act: Option<Ex> = None;
+        let mut open = true;
+        let mut win = egui::Window::new(RichText::new("Export audio").strong())
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .default_width(470.0)
+            .frame(Frame::window(&ctx.style()).inner_margin(Margin::same(20)));
+        if !busy {
+            win = win.open(&mut open);
+        }
+        win.show(ctx, |ui| {
+            let Some(w) = &mut self.export else { return };
+            ui.label(RichText::new(&w.title).strong().size(17.0));
+            let voice = config::profile_label(&w.voice);
+            let sub = if w.author.is_empty() { voice } else { format!("by {} · {}", w.author, voice) };
+            ui.label(RichText::new(sub).color(DIM));
+            ui.add_space(12.0);
+            let (kept, have) = export::counts(&w.chapters, w.include_skipped);
+            let dur: f32 = export::selected(&w.chapters, w.include_skipped)
+                .iter()
+                .filter_map(|&i| w.chapters[i].audio.as_ref())
+                .map(|a| a.dur)
+                .sum();
+            let plural = if have == 1 { "" } else { "s" };
+            ui.label(RichText::new(format!("{have} chapter{plural} · {}", fmt_time(dur))).small().color(DIM));
+            let missing = kept.saturating_sub(have);
+            if missing > 0 {
+                let (p1, p2) = (if have == 1 { "has" } else { "have" }, if missing == 1 { "is" } else { "are" });
+                ui.label(RichText::new(format!("{have} of {kept} chapters {p1} audio; the other {missing} {p2} left out")).small().color(DIM));
+            }
+            ui.add_space(8.0);
+            ui.add_enabled(!busy, egui::Checkbox::new(&mut w.include_skipped, "Include skipped sections"));
+            if !busy {
+                section(ui, "FORMAT");
+                ui.radio_value(&mut w.m4b, false, "One WAV file per chapter");
+                let m4b_avail = w.ffmpeg.is_some();
+                if ui.add_enabled(m4b_avail, egui::RadioButton::new(w.m4b, "One M4B file with chapters")).clicked() {
+                    w.m4b = true;
+                }
+                if !m4b_avail {
+                    ui.label(RichText::new("M4B export needs ffmpeg installed.").small().color(DIM));
+                }
+                section(ui, "DESTINATION");
+                ui.horizontal(|ui| {
+                    let label = if w.picking { "Choosing…" } else { "Choose folder…" };
+                    if ui.add_enabled(!w.picking, Button::new(label)).clicked() {
+                        act = Some(Ex::Pick);
+                    }
+                    ui.style_mut().wrap_mode = Some(TextWrapMode::Truncate);
+                    let text = w.dest.as_ref().map_or("No folder chosen yet".to_string(), |d| d.display().to_string());
+                    ui.label(RichText::new(text).small().color(DIM));
+                });
+                if let Some(e) = &w.dest_err {
+                    ui.label(RichText::new(e).small().color(DANGER));
+                }
+                ui.add_space(14.0);
+                let can = !w.picking && w.dest.is_some() && w.dest_err.is_none() && have > 0 && (!w.m4b || m4b_avail);
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(can, Button::new(RichText::new("Export").color(ON_ACCENT).strong()).fill(ACCENT)).clicked() {
+                        act = Some(Ex::Start);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        act = Some(Ex::Close);
+                    }
+                });
+            }
+            if let Some(b) = &w.busy {
+                let (frac, label, cancelling) = (b.frac, b.label.clone(), b.cancelling);
+                ui.add_space(10.0);
+                ui.label(RichText::new(if cancelling { "Cancelling…" } else { "Exporting…" }).strong());
+                ui.add(ProgressBar::new(frac).desired_height(8.0).fill(ACCENT).corner_radius(4.0));
+                ui.label(RichText::new(label).small().color(DIM));
+                ui.add_space(6.0);
+                if !cancelling && ui.button("Cancel").clicked() {
+                    act = Some(Ex::Cancel);
+                }
+            }
+            if let Some(r) = &w.result {
+                ui.add_space(10.0);
+                match r {
+                    Ok((p, true)) => {
+                        ui.label(RichText::new(format!("Done. The audiobook is {}", p.display())).color(DIM));
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Open folder").clicked() {
+                                act = Some(Ex::Open((p.clone(), true)));
+                            }
+                            if ui.button("Close").clicked() {
+                                act = Some(Ex::Close);
+                            }
+                        });
+                    }
+                    Ok((p, false)) => {
+                        ui.label(RichText::new(format!("Done. The files are in {}", p.display())).color(DIM));
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Open folder").clicked() {
+                                act = Some(Ex::Open((p.clone(), false)));
+                            }
+                            if ui.button("Close").clicked() {
+                                act = Some(Ex::Close);
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        ui.label(RichText::new(format!("Export failed: {e}")).color(DANGER));
+                        ui.add_space(8.0);
+                        if ui.button("Close").clicked() {
+                            act = Some(Ex::Close);
+                        }
+                    }
+                }
+            }
+        });
+        match act {
+            Some(Ex::Close) => self.export = None,
+            Some(Ex::Pick) => self.pick_export_dest(),
+            Some(Ex::Start) => self.start_export(),
+            Some(Ex::Cancel) => self.cancel_export(),
+            Some(Ex::Open((p, m4b))) => {
+                let dir = if m4b { p.parent().map(std::path::Path::to_path_buf).unwrap_or(p) } else { p };
+                crate::open_folder(&dir);
+            }
+            None => {}
+        }
+        if !open {
+            self.export = None;
+        }
+    }
+
     fn toast(&mut self, ctx: &egui::Context) {
         let Some(s) = &self.status else { return };
         let life = if s.error { 10.0 } else { 4.0 };
@@ -1545,6 +2166,35 @@ impl App {
 /// Byte index of the `n`-th char.
 fn byte_at(s: &str, n: usize) -> usize {
     s.char_indices().nth(n).map_or(s.len(), |(b, _)| b)
+}
+
+/// The whitespace-delimited word around char index `c`, if the pointer sits on one.
+fn word_at(s: &str, c: usize) -> Option<String> {
+    let cs: Vec<char> = s.chars().collect();
+    let c = if c < cs.len() && !cs[c].is_whitespace() {
+        c
+    } else if c > 0 && !cs[c - 1].is_whitespace() {
+        c - 1 // the cursor landed just past the clicked word
+    } else {
+        return None;
+    };
+    let (mut i, mut j) = (c, c + 1);
+    while i > 0 && !cs[i - 1].is_whitespace() {
+        i -= 1;
+    }
+    while j < cs.len() && !cs[j].is_whitespace() {
+        j += 1;
+    }
+    Some(cs[i..j].iter().collect())
+}
+
+/// "⟳  Regenerate 3 chapters that contain “word”" (one chapter … that contains).
+fn regen_label(word: &str, n: usize) -> String {
+    if n == 1 {
+        format!("⟳  Regenerate 1 chapter that contains “{word}”")
+    } else {
+        format!("⟳  Regenerate {n} chapters that contain “{word}”")
+    }
 }
 
 // =============================== install window pieces ===============================
