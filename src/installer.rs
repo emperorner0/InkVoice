@@ -176,6 +176,7 @@ fn installed_in(name: &str, d: &Path) -> bool {
 }
 
 /// Remove an engine's model files (the shared Python environment stays; it is small).
+/// Qwen3 runs in its own environment, `venv-qwen3`, which is removed with it.
 pub fn remove(name: &str) {
     remove_in(name, &data_dir());
     if name == "phonon" {
