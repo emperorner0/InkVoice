@@ -201,6 +201,8 @@ pub struct App {
     install: Option<installer::Install>,
     inst: InstallUi,
     installed: HashSet<String>,
+    /// engines that are not installed but still have folders on disk, so Remove stays offered
+    leftover: HashSet<String>,
     confirm_uninstall: Option<String>,
     /// when the listening position was last written to progress.json
     listen_saved: Instant,
@@ -295,6 +297,7 @@ impl App {
                 result: None,
             },
             installed: installer::SPECS.iter().filter(|s| installer::is_installed(s.name)).map(|s| s.name.to_string()).collect(),
+            leftover: leftover_engines(),
             confirm_uninstall: None,
             listen_saved: Instant::now(),
             pron_win: None,
@@ -878,6 +881,7 @@ impl App {
         }
         let removal = installer::remove(name, self.install.is_none());
         self.confirm_uninstall = None;
+        self.leftover = leftover_engines();
         if !removal.installed {
             self.installed.remove(name);
             if self.cfg.engine == name {
@@ -922,6 +926,7 @@ impl App {
         let name = inst.engine.clone();
         let title = installer::spec(&name).map_or(name.clone(), |s| s.title.to_string());
         self.install = None;
+        self.leftover = leftover_engines();
         match r {
             Ok(()) if installer::is_installed(&name) => {
                 self.inst.target = 1.0;
@@ -1771,6 +1776,10 @@ fn clear_audio_dir(
 fn open_folder(dir: &Path) {
     let prog = if cfg!(target_os = "windows") { "explorer" } else if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
     let _ = std::process::Command::new(prog).arg(dir).spawn();
+}
+
+fn leftover_engines() -> HashSet<String> {
+    installer::SPECS.iter().filter(|s| installer::has_leftovers(s.name)).map(|s| s.name.to_string()).collect()
 }
 
 /// One voice folder's worth of the one-time audio renaming.

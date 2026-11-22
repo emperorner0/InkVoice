@@ -246,35 +246,57 @@ fn clear_download_cache(d: &Path) {
 fn remove_in(name: &str, d: &Path, wait: Duration) -> bool {
     let until = Instant::now() + wait;
     let mut clean = true;
-    match name {
-        "qwen3" => {
-            clean &= remove_tree(&d.join("venv-qwen3"), until);
-            for e in std::fs::read_dir(d.join("hf").join("hub")).into_iter().flatten().flatten() {
-                let n = e.file_name().into_string().unwrap_or_default();
-                if n.starts_with("models--Qwen--") || n == WORD_TIMING_MODEL {
-                    clean &= remove_tree(&e.path(), until);
-                }
-            }
-            if !installed_in("phonon", d) && hub_only_housekeeping(&d.join("hf").join("hub")) {
-                clean &= remove_tree(&d.join("hf"), until);
-            }
-        }
-        "phonon" => {
-            // only the folders Phonon's warm-up fetched; the cache may hold other things
-            for e in std::fs::read_dir(d.join("hf").join("hub")).into_iter().flatten().flatten() {
-                if e.file_name().to_string_lossy().starts_with(PHONON_MODELS) {
-                    clean &= remove_tree(&e.path(), until);
-                }
-            }
-            if !installed_in("qwen3", d) && hub_only_housekeeping(&d.join("hf").join("hub")) {
-                clean &= remove_tree(&d.join("hf"), until);
-            }
-        }
-        "kokoro" => clean = remove_tree(&d.join("models").join("kokoro"), until),
-        "woof" => clean = remove_tree(&d.join("models").join("woof"), until),
-        _ => {}
+    for p in own_folders(name, d) {
+        clean &= remove_tree(&p, until);
+    }
+    // the other engine that keeps models in the Hugging Face cache
+    let sharer = match name {
+        "qwen3" => "phonon",
+        "phonon" => "qwen3",
+        _ => return clean,
+    };
+    if !installed_in(sharer, d) && hub_only_housekeeping(&d.join("hf").join("hub")) {
+        clean &= remove_tree(&d.join("hf"), until);
     }
     clean
+}
+
+/// The folders on disk that belong to one engine alone: what removing it deletes.
+fn own_folders(name: &str, d: &Path) -> Vec<PathBuf> {
+    let hub = |mine: &dyn Fn(&str) -> bool| -> Vec<PathBuf> {
+        std::fs::read_dir(d.join("hf").join("hub"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| mine(&e.file_name().to_string_lossy()))
+            .map(|e| e.path())
+            .collect()
+    };
+    let mut out = match name {
+        "qwen3" => {
+            let mut v = vec![d.join("venv-qwen3")];
+            v.extend(hub(&|n| n.starts_with("models--Qwen--") || n == WORD_TIMING_MODEL));
+            v
+        }
+        // only the folders Phonon's warm-up fetched; the cache may hold other things
+        "phonon" => hub(&|n| n.starts_with(PHONON_MODELS)),
+        "kokoro" => vec![d.join("models").join("kokoro")],
+        "woof" => vec![d.join("models").join("woof")],
+        _ => Vec::new(),
+    };
+    out.retain(|p| p.exists());
+    out
+}
+
+/// Whether an engine that is not installed still has folders of its own on disk, as after
+/// a removal that could not delete everything. Such an engine can still be removed.
+pub fn has_leftovers(name: &str) -> bool {
+    leftovers_in(name, &data_dir())
+}
+
+/// [`has_leftovers`] against a given data folder, so it can be tested on a temporary tree.
+fn leftovers_in(name: &str, d: &Path) -> bool {
+    !installed_in(name, d) && !own_folders(name, d).is_empty()
 }
 
 /// Whether the Hugging Face cache hub still holds anything but its own bookkeeping (`.locks`, …).
@@ -938,9 +960,46 @@ mod tests {
         assert!(r.notice("Kokoro").is_err_and(|t| t.contains("could not be removed")));
         // an engine that still passes the installed check is not reported as removed either
         assert!(super::Removal { clean: true, installed: true }.notice("Kokoro").is_err());
+        assert!(!r.installed && super::leftovers_in("kokoro", &d), "not installed, but still removable");
         drop(held);
         assert!(super::remove_in("kokoro", &d, super::REMOVE_WAIT));
         assert!(!super::installed_in("kokoro", &d));
+        assert!(!super::leftovers_in("kokoro", &d), "nothing is left to remove");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// What a removal that stopped part way leaves: the engine no longer passes the installed
+    /// check, but folders of its own are still on disk and a second removal clears them.
+    #[test]
+    fn a_half_removed_engine_has_leftovers_until_it_is_removed_again() {
+        let d = std::env::temp_dir().join(format!("inkvoice-leftovers-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let names = || super::SPECS.iter().map(|s| s.name);
+        assert!(names().all(|n| !super::leftovers_in(n, &d)), "an empty data folder has none");
+
+        for n in names() {
+            fake_install(&d, n);
+        }
+        std::fs::create_dir_all(d.join("hf").join("hub").join("models--gradium--phonon-31m-en")).unwrap();
+        assert!(names().all(|n| !super::leftovers_in(n, &d)), "an installed engine is not a leftover");
+
+        // Qwen3 lost its Python and one Kokoro model file went, the rest stayed behind
+        std::fs::remove_file(super::python_in_venv(&d.join("venv-qwen3"))).unwrap();
+        std::fs::remove_file(d.join("models").join("kokoro").join("voices-v1.0.bin")).unwrap();
+        assert!(!super::installed_in("qwen3", &d) && super::leftovers_in("qwen3", &d));
+        assert!(!super::installed_in("kokoro", &d) && super::leftovers_in("kokoro", &d));
+        assert!(!super::leftovers_in("woof", &d) && !super::leftovers_in("phonon", &d), "the others are untouched");
+
+        assert!(super::remove_in("qwen3", &d, super::REMOVE_WAIT));
+        assert!(super::remove_in("kokoro", &d, super::REMOVE_WAIT));
+        assert!(!super::leftovers_in("qwen3", &d) && !super::leftovers_in("kokoro", &d));
+        assert!(super::installed_in("woof", &d) && super::installed_in("phonon", &d));
+
+        // Phonon's package went but its model folder stayed
+        std::fs::remove_dir_all(d.join("venv").join("Lib").join("site-packages").join("ptts")).unwrap();
+        assert!(super::leftovers_in("phonon", &d));
+        assert!(super::remove_in("phonon", &d, super::REMOVE_WAIT));
+        assert!(!super::leftovers_in("phonon", &d));
         let _ = std::fs::remove_dir_all(&d);
     }
 

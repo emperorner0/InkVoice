@@ -1725,8 +1725,20 @@ impl App {
                                 }
                                 ui.label(RichText::new("✔ Installed").color(ACCENT));
                             }
-                        } else if ui.add_enabled(busy.is_none(), Button::new(RichText::new("Install").color(ON_ACCENT).strong()).fill(ACCENT)).clicked() {
-                            install = Some(s.name);
+                        } else {
+                            if ui.add_enabled(busy.is_none(), Button::new(RichText::new("Install").color(ON_ACCENT).strong()).fill(ACCENT)).clicked() {
+                                install = Some(s.name);
+                            }
+                            let confirming = self.confirm_uninstall.as_deref() == Some(s.name);
+                            if self.leftover.contains(s.name) && confirming {
+                                if ui.add(Button::new(RichText::new("Remove").color(ON_ACCENT)).fill(DANGER)).clicked() {
+                                    remove = Some(s.name);
+                                }
+                            } else if self.leftover.contains(s.name)
+                                && ui.add(Button::new(RichText::new("Remove").color(DIM)).frame(false)).on_hover_text("Delete the files this engine left behind").clicked()
+                            {
+                                self.confirm_uninstall = Some(s.name.to_string());
+                            }
                         }
                     });
                 });
