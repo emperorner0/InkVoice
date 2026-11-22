@@ -1518,7 +1518,7 @@ impl App {
                                     .small()
                                     .color(DIM),
                             );
-                            if let Some(o) = &regen_offer {
+                            if let Some(o) = regen_offer.as_ref().filter(|o| !o.chapters.is_empty()) {
                                 let n = o.chapters.len();
                                 if ui.add(Button::new(RichText::new(regen_label(&o.word, n)).color(ACCENT)).frame(false))
                                     .on_hover_text("Existing audio keeps the old pronunciation until it is regenerated")

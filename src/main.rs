@@ -173,7 +173,7 @@ pub struct App {
     /// ready wav files of the open book for the current voice profile
     have: HashSet<PathBuf>,
     /// their unit keys, so a unit is found whatever name form its file is in
-    have_keys: HashMap<(usize, Option<usize>), PathBuf>,
+    have_keys: AudioKeys,
     lib_audio: HashMap<String, Vec<AudioItem>>,
     /// leftover files per book, for the audio manager's clean-up offer
     lib_junk: HashMap<String, Vec<JunkFile>>,
@@ -373,8 +373,7 @@ impl App {
         if self.have.contains(path) || path.exists() {
             return Some(path.to_path_buf());
         }
-        let key = path.file_stem()?.to_str().and_then(parse_unit_name)?;
-        self.have_keys.get(&key).cloned()
+        known_audio(&self.have_keys, path)
     }
     fn is_ready(&self, path: &Path) -> bool {
         self.existing_audio(path).is_some()
@@ -400,7 +399,7 @@ impl App {
             let mut paths: Vec<PathBuf> = rd.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e == "wav")).collect();
             paths.sort(); // the readable name form sorts before the old bare "c..." form
             for p in paths {
-                if let Some(k) = p.file_stem().and_then(|s| s.to_str()).and_then(parse_unit_name) {
+                if let Some(k) = audio_key(&p) {
                     self.have_keys.entry(k).or_insert_with(|| p.clone());
                 }
                 self.have.insert(p);
@@ -812,7 +811,7 @@ impl App {
                 remove_unit_files(dir, ch, u.pg);
             }
             self.have.remove(&path);
-            if let Some(k) = path.file_stem().and_then(|s| s.to_str()).and_then(parse_unit_name) {
+            if let Some(k) = audio_key(&path) {
                 self.have_keys.remove(&k);
             }
             self.enqueue(u);
@@ -1328,9 +1327,7 @@ impl App {
                         self.job = None;
                     }
                     self.have.insert(p.clone());
-                    if let Some(k) = p.file_stem().and_then(|s| s.to_str()).and_then(parse_unit_name) {
-                        self.have_keys.insert(k, p.clone());
-                    }
+                    note_audio(&mut self.have_keys, &p);
                     if let Some(id) = book_id_of(&p) {
                         changed_books.insert(id);
                     }
@@ -1539,6 +1536,23 @@ fn install_workers() {
 }
 
 /// .../books/<id>/audio/<profile>/c0001.wav -> id
+/// Audio files by the folder they are in and their unit key, whichever name form they have.
+type AudioKeys = HashMap<(PathBuf, (usize, Option<usize>)), PathBuf>;
+
+fn audio_key(p: &Path) -> Option<(PathBuf, (usize, Option<usize>))> {
+    Some((p.parent()?.to_path_buf(), parse_unit_name(p.file_stem()?.to_str()?)?))
+}
+
+fn known_audio(keys: &AudioKeys, path: &Path) -> Option<PathBuf> {
+    keys.get(&audio_key(path)?).cloned()
+}
+
+fn note_audio(keys: &mut AudioKeys, p: &Path) {
+    if let Some(k) = audio_key(p) {
+        keys.insert(k, p.to_path_buf());
+    }
+}
+
 fn book_id_of(p: &Path) -> Option<String> {
     Some(p.parent()?.parent()?.parent()?.file_name()?.to_string_lossy().into_owned())
 }
@@ -2060,6 +2074,22 @@ mod tests {
         assert_eq!(parse_unit_name("junk"), None);
         let u = unit_of(Path::new("/x/books/my_book/audio/phonon-everly/c0002_p0001.wav")).unwrap();
         assert_eq!(u, Unit { book: "my_book".into(), ch: 2, pg: Some(1) });
+    }
+
+    /// A finished job of another book never makes a section of the open book count as ready,
+    /// and does not displace the open book's own file for the same section.
+    #[test]
+    fn finished_audio_of_another_book_is_not_ready_here() {
+        let open_dir = Path::new("/x/books/book_b/audio/phonon-everly");
+        let old_form = open_dir.join("c0002.wav");
+        let mut keys = AudioKeys::new();
+        note_audio(&mut keys, &old_form);
+        note_audio(&mut keys, Path::new("/x/books/book_a/audio/phonon-everly/02_Other_c0002.wav"));
+        note_audio(&mut keys, Path::new("/x/books/book_a/audio/phonon-everly/03_Other_c0003.wav"));
+        assert_eq!(known_audio(&keys, &open_dir.join("03_Mine_c0003.wav")), None);
+        assert_eq!(known_audio(&keys, &open_dir.join("02_Mine_c0002.wav")), Some(old_form));
+        // another voice of the same book is a different folder too
+        assert_eq!(known_audio(&keys, Path::new("/x/books/book_b/audio/kokoro-sky/02_Mine_c0002.wav")), None);
     }
 
     #[test]

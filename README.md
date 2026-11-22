@@ -85,6 +85,9 @@ This repository is a fork of [sabeel111/InkVoice](https://github.com/sabeel111/I
   local model that was tested: on real sentences it chose the right reading of "read" 5 times out of 13. The
   built-in rules and the pronunciation table do not have this problem and are the recommended way to use it.
 - The pronunciation table does not match a word that is joined to another by a dash with no spaces.
+- Voice engines that were installed with the original app, before this fork, lack the package that the
+  pronunciation helper's built-in rules need. The rules stay off until the engine is removed and installed
+  again from Settings. The pronunciation table works either way.
 - PDFs are imported as fixed 10-page chunks, so front and back matter is rarely recognised in them.
 - Renaming a section later does not rename audio files that already exist; they keep working.
 - Export has been tested on a short generated book, not on a full-length one. M4B export needs `ffmpeg`
